@@ -1,0 +1,10 @@
+# 基础版依赖
+PyQt6==6.6.1
+mss==9.0.1
+opencv-python==4.9.0.80
+numpy==1.26.3
+Pillow==10.2.0
+
+# Pro版音频依赖
+pyaudio==0.2.14
+moviepy==1.0.3
