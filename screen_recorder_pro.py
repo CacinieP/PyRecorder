@@ -273,7 +273,7 @@ class ScreenRecorderPro(QMainWindow):
     def __init__(self):
         super().__init__()
         self.recording_thread = None
-        self.output_path = ""
+        self.output_folder = ""
         self.audio_path = ""
         self.region = None
         self.start_time = None
@@ -282,7 +282,7 @@ class ScreenRecorderPro(QMainWindow):
 
     def init_ui(self):
         """Initialize the user interface"""
-        self.setWindowTitle("Screen Recorder Pro")
+        self.setWindowTitle("PyRecorder Pro")
         self.setMinimumSize(500, 450)
 
         # Central widget
@@ -291,7 +291,7 @@ class ScreenRecorderPro(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         # Title
-        title_label = QLabel("Windows Screen Recorder Pro")
+        title_label = QLabel("PyRecorder Pro - Screen Recorder with Audio")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_font = QFont()
         title_font.setPointSize(16)
@@ -407,17 +407,16 @@ class ScreenRecorderPro(QMainWindow):
         main_layout.addStretch()
 
     def browse_file(self):
-        """Open file dialog to select output location"""
-        file_path, _ = QFileDialog.getSaveFileName(
+        """Open folder dialog to select save location"""
+        folder_path = QFileDialog.getExistingDirectory(
             self,
-            "Save Recording As",
-            f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
-            "Video Files (*.mp4 *.avi);;All Files (*)"
+            "Select Save Folder",
+            ""
         )
 
-        if file_path:
-            self.output_path = file_path
-            self.path_label.setText(file_path)
+        if folder_path:
+            self.output_folder = folder_path
+            self.path_label.setText(folder_path)
 
     def select_region(self):
         """Open region selector"""
@@ -442,11 +441,16 @@ class ScreenRecorderPro(QMainWindow):
 
     def start_recording(self):
         """Start screen recording"""
-        # Validate output path
-        if not self.output_path:
+        # Validate output folder
+        if not self.output_folder:
             self.browse_file()
-            if not self.output_path:
+            if not self.output_folder:
                 return
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_path = f"{self.output_folder}/recording_{timestamp}.mp4"
+        self.current_output_path = output_path
 
         # Get settings
         fps = self.fps_spinbox.value()
@@ -455,7 +459,7 @@ class ScreenRecorderPro(QMainWindow):
 
         # Setup audio path
         if record_audio:
-            base_path = os.path.splitext(self.output_path)[0]
+            base_path = os.path.splitext(output_path)[0]
             self.audio_path = f"{base_path}_audio.wav"
         else:
             self.audio_path = None
@@ -540,8 +544,8 @@ class ScreenRecorderPro(QMainWindow):
 
         QMessageBox.information(
             self,
-            "Recording Complete",
-            f"Recording saved to:\n{self.output_path}\n\n"
+            "PyRecorder - Recording Complete",
+            f"Recording saved to:\n{self.current_output_path}\n\n"
             f"Total frames: {self.frame_count_label.text().split(': ')[1]}\n"
             f"Duration: {elapsed:.1f} seconds"
         )
@@ -550,7 +554,7 @@ class ScreenRecorderPro(QMainWindow):
         """Handle recording error"""
         QMessageBox.critical(
             self,
-            "Recording Error",
+            "PyRecorder - Error",
             f"An error occurred during recording:\n{error_msg}"
         )
 
