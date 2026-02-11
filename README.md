@@ -1,4 +1,4 @@
-# Windows Screen Recorder
+# PyRecorder
 
 一个简单易用的Windows录屏软件，具有图形用户界面。
 
@@ -17,6 +17,7 @@
 - 多种视频编码格式支持（MP4, AVI）
 - 实时录制进度显示
 - 简洁直观的用户界面
+- 自动生成带时间戳的文件名
 
 ### Pro版
 - 包含基础版所有功能
@@ -25,11 +26,49 @@
 - 录制时长无限制
 - 完善的错误处理机制
 
+## 快速开始
+
+### 方式一：使用启动脚本（推荐）
+
+双击 `start.bat` 即可运行，脚本会自动检测环境并提供菜单选项：
+
+```
+===============================================================
+              PyRecorder - Windows Screen Recorder
+                       Version 1.0.0
+                       MIT License
+===============================================================
+
+[OK] Python 3.x.x installed
+[OK] pip ready
+
+Select version to run:
+  [1] Basic (Screen recording only)
+  [2] Pro   (Screen + Audio recording)
+  [3] Install/Update dependencies
+  [4] Project info
+  [0] Exit
+```
+
+### 方式二：命令行运行
+
+**基础版：**
+```bash
+python screen_recorder.py
+```
+
+**Pro版：**
+```bash
+python screen_recorder_pro.py
+```
+
 ## 安装
 
-1. 确保已安装 Python 3.8 或更高版本
+### 自动安装
 
-2. 安装依赖：
+运行 `start.bat`，选择选项 `[3]` 自动安装所有依赖。
+
+### 手动安装
 
 **基础版：**
 ```bash
@@ -48,25 +87,23 @@ pip install -r requirements.txt
 
 ## 使用方法
 
-### 基础版
-```bash
-python screen_recorder.py
-```
-
-### Pro版
-```bash
-python screen_recorder_pro.py
-```
-
 ### 操作步骤
 
-1. **选择保存位置**：点击"Browse..."选择输出文件路径
+1. **选择保存文件夹**：点击"Browse..."选择保存视频的文件夹
 2. **Pro版勾选音频**：勾选"Record Audio (Microphone)"启用音频录制
 3. **调整帧率**：设置录制帧率（默认30 FPS）
 4. **选择编码格式**：选择视频编码器（默认mp4v）
 5. **选择录制区域**：选择"Full Screen"或点击"Select Region"自定义区域
 6. **开始录制**：点击"Start Recording"
 7. **停止录制**：点击"Stop Recording"保存视频
+
+### 文件命名
+
+录制完成后，视频会自动保存为：
+```
+recording_YYYYMMDD_HHMMSS.mp4
+例如：recording_20250211_143052.mp4
+```
 
 ## 视频编码格式说明
 
@@ -111,7 +148,7 @@ python screen_recorder_pro.py
 ## 注意事项
 
 - 录制高帧率会占用更多CPU和内存
-- 保存视频文件前请确保磁盘空间充足
+- 保存视频前请确保磁盘空间充足
 - Pro版首次录制时会下载ffmpeg，可能需要几秒钟
 - 麦克风权限需要在Windows设置中允许
 
@@ -145,7 +182,7 @@ python -m imageio_download_bin
 
 ```
 ┌─────────────────────────────────────────┐
-│           PyQt6 GUI 界面                 │
+│           PyRecorder GUI (PyQt6)         │
 ├─────────────────────────────────────────┤
 │         录制线程 (QThread)               │
 ├──────────────────┬──────────────────────┤
@@ -160,3 +197,7 @@ python -m imageio_download_bin
 ## 许可证
 
 MIT License
+
+## GitHub
+
+https://github.com/CacinieP/PyRecorder
