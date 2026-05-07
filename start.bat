@@ -10,7 +10,7 @@ cls
 echo.
 echo ===============================================================
 echo              PyRecorder - Windows Screen Recorder
-echo                       Version 1.0.0
+echo                       Version 2.0.0
 echo                       MIT License
 echo ===============================================================
 echo.
@@ -51,7 +51,7 @@ color 0A
 echo Select version to run:
 echo.
 echo   [1] Basic (Screen recording only)
-echo   [2] Pro   (Screen + Audio recording)
+echo   [2] Pro   (Screen + Audio + Webcam overlay)
 echo   [3] Install/Update dependencies
 echo   [4] Project info
 echo   [0] Exit
@@ -150,7 +150,7 @@ echo              Project Information
 echo ================================================================
 echo.
 echo Project: PyRecorder
-echo Version : 1.0.0
+echo Version : 2.0.0
 echo License : MIT License
 echo.
 echo Features:
@@ -158,6 +158,9 @@ echo   - Full screen or custom region recording
 echo   - Adjustable frame rate (10-60 FPS)
 echo   - Multiple video codec support
 echo   - Pro version with audio recording
+echo   - Webcam picture-in-picture overlay (teaching mode)
+echo   - 4 overlay positions, adjustable size
+echo   - Live webcam preview
 echo.
 echo GitHub: https://github.com/CacinieP/PyRecorder
 echo.
