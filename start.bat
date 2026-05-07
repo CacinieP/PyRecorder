@@ -51,7 +51,7 @@ color 0A
 echo Select version to run:
 echo.
 echo   [1] Basic (Screen recording only)
-echo   [2] Pro   (Screen + Audio + Webcam overlay)
+echo   [2] Pro   (Screen + Audio + Webcam + Window capture)
 echo   [3] Install/Update dependencies
 echo   [4] Project info
 echo   [0] Exit
@@ -159,8 +159,10 @@ echo   - Adjustable frame rate (10-60 FPS)
 echo   - Multiple video codec support
 echo   - Pro version with audio recording
 echo   - Webcam picture-in-picture overlay (teaching mode)
+echo   - Window capture (select specific application window)
 echo   - 4 overlay positions, adjustable size
 echo   - Live webcam preview
+echo   - Real-time recording preview
 echo.
 echo GitHub: https://github.com/CacinieP/PyRecorder
 echo.

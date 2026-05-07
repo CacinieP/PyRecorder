@@ -1,6 +1,6 @@
 """
 Windows Screen Recorder Pro
-Screen recording with audio and webcam overlay support
+Screen recording with audio, webcam overlay, and window capture support
 """
 
 import sys
@@ -10,7 +10,7 @@ from mss import mss
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QFileDialog, QComboBox, QGroupBox,
-    QMessageBox, QProgressBar, QCheckBox, QDialog
+    QMessageBox, QProgressBar, QCheckBox, QDialog, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QImage, QPixmap
@@ -20,6 +20,39 @@ import pyaudio
 import wave
 import os
 from moviepy import VideoFileClip, AudioFileClip
+import ctypes
+from ctypes import wintypes
+
+user32 = ctypes.windll.user32
+
+
+def get_visible_windows():
+    """Enumerate all visible windows with titles using Win32 API"""
+    windows = []
+
+    def enum_callback(hwnd, lparam):
+        if user32.IsWindowVisible(hwnd):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value
+                if title:
+                    rect = wintypes.RECT()
+                    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    if w > 50 and h > 50:
+                        windows.append({
+                            'title': title,
+                            'hwnd': hwnd,
+                            'rect': (rect.left, rect.top, w, h)
+                        })
+        return True
+
+    callback = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(enum_callback)
+    user32.EnumWindows(callback, 0)
+    return windows
 
 
 class AudioRecorder:
@@ -35,10 +68,8 @@ class AudioRecorder:
         self.audio = pyaudio.PyAudio()
 
     def start(self):
-        """Start audio recording"""
         self.frames = []
         self.is_recording = True
-
         try:
             self.stream = self.audio.open(
                 format=pyaudio.paInt16,
@@ -54,22 +85,16 @@ class AudioRecorder:
             self.is_recording = False
 
     def _callback(self, in_data, frame_count, time_info, status):
-        """Audio stream callback"""
         if self.is_recording:
             self.frames.append(in_data)
         return (None, pyaudio.paContinue)
 
     def stop(self):
-        """Stop audio recording and save"""
         self.is_recording = False
-
         if hasattr(self, 'stream'):
             self.stream.stop_stream()
             self.stream.close()
-
         self.audio.terminate()
-
-        # Save audio file
         if self.frames:
             try:
                 wf = wave.open(self.output_path, 'wb')
@@ -111,7 +136,7 @@ class WebcamPreviewDialog(QDialog):
         super().showEvent(event)
         self.cap = cv2.VideoCapture(0)
         if self.cap.isOpened():
-            self.timer.start(33)  # ~30fps
+            self.timer.start(33)
         else:
             self.video_label.setText("Cannot open webcam.\nCheck if camera is connected.")
             if self.cap:
@@ -124,8 +149,7 @@ class WebcamPreviewDialog(QDialog):
             if ret:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = frame.shape
-                bytes_per_line = ch * w
-                qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                qimg = QImage(frame.data, w, h, ch * w, QImage.Format.Format_RGB888)
                 pixmap = QPixmap.fromImage(qimg).scaled(
                     self.video_label.size(),
                     Qt.AspectRatioMode.KeepAspectRatio,
@@ -144,12 +168,13 @@ class WebcamPreviewDialog(QDialog):
 class RecordingThread(QThread):
     """Thread for handling screen recording"""
     progress = pyqtSignal(int)
+    preview_frame = pyqtSignal(object)
     finished = pyqtSignal()
     error = pyqtSignal(str)
 
     def __init__(self, output_path, fps, codec, region=None, record_audio=False,
                  audio_path=None, webcam_enabled=False, webcam_position="bottom-right",
-                 webcam_size=240):
+                 webcam_size=240, window_hwnd=None, window_rect=None):
         super().__init__()
         self.output_path = output_path
         self.fps = fps
@@ -160,12 +185,13 @@ class RecordingThread(QThread):
         self.webcam_enabled = webcam_enabled
         self.webcam_position = webcam_position
         self.webcam_size = webcam_size
+        self.window_hwnd = window_hwnd
+        self.window_rect = window_rect
         self.is_running = True
         self.frame_count = 0
         self.audio_recorder = None
 
     def _overlay_webcam(self, frame, cam_frame, width, height):
-        """Overlay webcam frame onto screen frame at specified position"""
         cam_h, cam_w = cam_frame.shape[:2]
         margin = 10
 
@@ -178,46 +204,67 @@ class RecordingThread(QThread):
         elif self.webcam_position == "top-left":
             y1 = margin
             x1 = margin
-        else:  # top-right
+        else:
             y1 = margin
             x1 = width - cam_w - margin
 
         y2 = y1 + cam_h
         x2 = x1 + cam_w
-
-        # Bounds check
         if y1 >= 0 and x1 >= 0 and y2 <= height and x2 <= width:
             frame[y1:y2, x1:x2] = cam_frame
 
+    def _emit_preview(self, img, width, height):
+        scale = min(480 / width, 360 / height, 1.0)
+        if scale < 1.0:
+            preview = cv2.resize(img, None, fx=scale, fy=scale)
+        else:
+            preview = img
+        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+        h, w, ch = preview_rgb.shape
+        qimg = QImage(preview_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+        self.preview_frame.emit(qimg)
+
     def run(self):
-        """Main recording loop"""
         cap = None
         try:
-            # Start audio recording if enabled
             if self.record_audio and self.audio_path:
                 self.audio_recorder = AudioRecorder(self.audio_path)
                 self.audio_recorder.start()
 
-            # Setup screen capture
             sct = mss()
 
-            # Define capture region
-            if self.region:
+            # Determine capture monitor
+            if self.window_rect:
+                # Window capture mode
+                wx, wy, ww, wh = self.window_rect
+                if self.region:
+                    # Sub-region within window (relative coords)
+                    monitor = {
+                        "top": wy + self.region[1],
+                        "left": wx + self.region[0],
+                        "width": min(self.region[2], ww - self.region[0]),
+                        "height": min(self.region[3], wh - self.region[1])
+                    }
+                else:
+                    monitor = {"top": wy, "left": wx, "width": ww, "height": wh}
+            elif self.region:
                 monitor = {"top": self.region[1], "left": self.region[0],
                           "width": self.region[2], "height": self.region[3]}
             else:
-                monitor = sct.monitors[1]  # Primary monitor
+                monitor = sct.monitors[1]
 
-            # Get screen dimensions
             width = monitor["width"]
             height = monitor["height"]
 
-            # Setup video writer
+            if width <= 0 or height <= 0:
+                self.error.emit("Invalid capture area (zero size)")
+                self.finished.emit()
+                return
+
             fourcc = cv2.VideoWriter_fourcc(*self.codec)
             temp_video_path = self.output_path.replace('.mp4', '_temp.mp4')
             out = cv2.VideoWriter(temp_video_path, fourcc, self.fps, (width, height))
 
-            # Setup webcam if enabled
             if self.webcam_enabled:
                 cap = cv2.VideoCapture(0)
                 if not cap.isOpened():
@@ -225,18 +272,13 @@ class RecordingThread(QThread):
 
             self.frame_count = 0
             last_time = datetime.now()
+            preview_interval = max(1, self.fps // 5)
 
             while self.is_running:
-                # Capture screen
                 screenshot = sct.grab(monitor)
-
-                # Convert to numpy array
                 img = np.array(screenshot)
-
-                # Convert RGB to BGR for OpenCV
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-                # Overlay webcam frame if enabled
                 if cap is not None and cap.isOpened():
                     ret, cam_frame = cap.read()
                     if ret:
@@ -246,38 +288,36 @@ class RecordingThread(QThread):
                         cam_frame = cv2.resize(cam_frame, (target_w, target_h))
                         self._overlay_webcam(img, cam_frame, width, height)
 
-                # Write frame
                 out.write(img)
                 self.frame_count += 1
 
-                # Emit progress every second
                 current_time = datetime.now()
                 if (current_time - last_time).seconds >= 1:
                     self.progress.emit(self.frame_count)
                     last_time = current_time
 
-                # Control frame rate
+                if self.frame_count % preview_interval == 0:
+                    self._emit_preview(img, width, height)
+
                 cv2.waitKey(int(1000 / self.fps))
 
-            # Release resources
             out.release()
             if cap is not None:
                 cap.release()
+
+            # Final preview
+            self._emit_preview(img, width, height)
             self.progress.emit(self.frame_count)
 
-            # Stop audio recording
             audio_success = False
             if self.audio_recorder:
                 audio_success = self.audio_recorder.stop()
 
-            # Merge audio and video if audio was recorded
             if self.record_audio and audio_success and os.path.exists(self.audio_path):
-                self.progress.emit(self.frame_count)
                 try:
                     video_clip = VideoFileClip(temp_video_path)
                     audio_clip = AudioFileClip(self.audio_path)
 
-                    # Trim audio to match video duration
                     video_duration = video_clip.duration
                     if audio_clip.duration > video_duration:
                         audio_clip = audio_clip.subclip(0, video_duration)
@@ -291,19 +331,15 @@ class RecordingThread(QThread):
                         logger=None
                     )
 
-                    # Clean up temp files
                     video_clip.close()
                     audio_clip.close()
                     os.remove(temp_video_path)
                     os.remove(self.audio_path)
-
                 except Exception as e:
                     self.error.emit(f"Failed to merge audio/video: {e}")
-                    # If merge fails, keep video only
                     if os.path.exists(temp_video_path):
                         os.rename(temp_video_path, self.output_path)
             else:
-                # No audio or audio failed, just rename temp file
                 if os.path.exists(temp_video_path):
                     os.rename(temp_video_path, self.output_path)
 
@@ -315,7 +351,6 @@ class RecordingThread(QThread):
         self.finished.emit()
 
     def stop(self):
-        """Stop recording"""
         self.is_running = False
         self.wait()
 
@@ -367,7 +402,6 @@ class RegionSelector(QWidget):
 
                 if w > 10 and h > 10:
                     self.region_selected.emit((x, y, w, h))
-
             self.close()
 
     def keyPressEvent(self, event):
@@ -376,7 +410,7 @@ class RegionSelector(QWidget):
 
 
 class ScreenRecorderPro(QMainWindow):
-    """Main application window - Pro version with audio and webcam"""
+    """Main application window - Pro version with audio, webcam, and window capture"""
 
     def __init__(self):
         super().__init__()
@@ -385,60 +419,98 @@ class ScreenRecorderPro(QMainWindow):
         self.audio_path = ""
         self.region = None
         self.start_time = None
+        self.current_output_path = ""
+        self._selected_window_rect = None
 
         self.init_ui()
 
     def init_ui(self):
-        """Initialize the user interface"""
         self.setWindowTitle("PyRecorder Pro")
-        self.setMinimumSize(520, 580)
+        self.setMinimumSize(960, 660)
 
-        # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setSpacing(10)
 
-        # Title
-        title_label = QLabel("PyRecorder Pro - Teaching Screen Recorder")
+        # ===== Left panel: settings =====
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_panel.setFixedWidth(420)
+
+        title_label = QLabel("PyRecorder Pro")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_font = QFont()
         title_font.setPointSize(16)
         title_font.setBold(True)
         title_label.setFont(title_font)
-        main_layout.addWidget(title_label)
+        left_layout.addWidget(title_label)
 
-        # Output settings group
+        # --- Output Settings ---
         output_group = QGroupBox("Output Settings")
         output_layout = QVBoxLayout()
-
-        # File path
         path_layout = QHBoxLayout()
-        path_layout.addWidget(QLabel("Save Location:"))
+        path_layout.addWidget(QLabel("Save:"))
         self.path_label = QLabel("Not selected")
+        self.path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         path_layout.addWidget(self.path_label)
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self.browse_file)
         path_layout.addWidget(browse_btn)
         output_layout.addLayout(path_layout)
-
         output_group.setLayout(output_layout)
-        main_layout.addWidget(output_group)
+        left_layout.addWidget(output_group)
 
-        # Recording settings group
+        # --- Recording Settings ---
         settings_group = QGroupBox("Recording Settings")
         settings_layout = QVBoxLayout()
 
-        # Audio recording
+        # Capture mode
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Capture:"))
+        self.capture_mode_combo = QComboBox()
+        self.capture_mode_combo.addItems(["Full Screen", "Custom Region", "Window Capture"])
+        self.capture_mode_combo.currentIndexChanged.connect(self.on_capture_mode_changed)
+        mode_layout.addWidget(self.capture_mode_combo)
+        settings_layout.addLayout(mode_layout)
+
+        # Window selector (shown for Window Capture)
+        window_layout = QHBoxLayout()
+        window_layout.addWidget(QLabel("Window:"))
+        self.window_combo = QComboBox()
+        self.window_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        window_layout.addWidget(self.window_combo)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_windows)
+        window_layout.addWidget(refresh_btn)
+        self.window_row = QWidget()
+        wl = QVBoxLayout(self.window_row)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.addLayout(window_layout)
+        self.window_row.hide()
+        settings_layout.addWidget(self.window_row)
+
+        # Region info row
+        region_layout = QHBoxLayout()
+        region_layout.addWidget(QLabel("Area:"))
+        self.region_label = QLabel("Full Screen")
+        self.region_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        region_layout.addWidget(self.region_label)
+        self.region_btn = QPushButton("Select Region")
+        self.region_btn.clicked.connect(self.select_region)
+        region_layout.addWidget(self.region_btn)
+        settings_layout.addLayout(region_layout)
+
+        # Audio
         audio_layout = QHBoxLayout()
         self.audio_checkbox = QCheckBox("Record Audio (Microphone)")
-        self.audio_checkbox.setChecked(False)
         audio_layout.addWidget(self.audio_checkbox)
         audio_layout.addStretch()
         settings_layout.addLayout(audio_layout)
 
-        # FPS setting
+        # FPS
         fps_layout = QHBoxLayout()
-        fps_layout.addWidget(QLabel("Frame Rate (FPS):"))
+        fps_layout.addWidget(QLabel("FPS:"))
         self.fps_spinbox = QSpinBox()
         self.fps_spinbox.setRange(10, 60)
         self.fps_spinbox.setValue(30)
@@ -446,55 +518,38 @@ class ScreenRecorderPro(QMainWindow):
         fps_layout.addStretch()
         settings_layout.addLayout(fps_layout)
 
-        # Codec setting
+        # Codec
         codec_layout = QHBoxLayout()
-        codec_layout.addWidget(QLabel("Video Codec:"))
+        codec_layout.addWidget(QLabel("Codec:"))
         self.codec_combo = QComboBox()
         self.codec_combo.addItems(["mp4v", "XVID", "MJPG"])
-        self.codec_combo.setCurrentText("mp4v")
         codec_layout.addWidget(self.codec_combo)
         codec_layout.addStretch()
         settings_layout.addLayout(codec_layout)
 
-        # Region setting
-        region_layout = QHBoxLayout()
-        region_layout.addWidget(QLabel("Recording Area:"))
-        self.region_label = QLabel("Full Screen")
-        region_layout.addWidget(self.region_label)
-        region_btn = QPushButton("Select Region")
-        region_btn.clicked.connect(self.select_region)
-        region_layout.addWidget(region_btn)
-        settings_layout.addLayout(region_layout)
-
         settings_group.setLayout(settings_layout)
-        main_layout.addWidget(settings_group)
+        left_layout.addWidget(settings_group)
 
-        # Webcam settings group
+        # --- Webcam Overlay ---
         webcam_group = QGroupBox("Webcam Overlay")
         webcam_layout = QVBoxLayout()
 
-        # Enable webcam
-        webcam_enable_layout = QHBoxLayout()
+        enable_layout = QHBoxLayout()
         self.webcam_checkbox = QCheckBox("Enable Webcam Overlay")
-        self.webcam_checkbox.setChecked(False)
-        webcam_enable_layout.addWidget(self.webcam_checkbox)
-        webcam_enable_layout.addStretch()
-        webcam_layout.addLayout(webcam_enable_layout)
+        enable_layout.addWidget(self.webcam_checkbox)
+        enable_layout.addStretch()
+        webcam_layout.addLayout(enable_layout)
 
-        # Webcam position
         pos_layout = QHBoxLayout()
         pos_layout.addWidget(QLabel("Position:"))
         self.webcam_pos_combo = QComboBox()
-        self.webcam_pos_combo.addItems([
-            "Bottom-Right", "Bottom-Left", "Top-Left", "Top-Right"
-        ])
+        self.webcam_pos_combo.addItems(["Bottom-Right", "Bottom-Left", "Top-Left", "Top-Right"])
         pos_layout.addWidget(self.webcam_pos_combo)
         pos_layout.addStretch()
         webcam_layout.addLayout(pos_layout)
 
-        # Webcam size
         size_layout = QHBoxLayout()
-        size_layout.addWidget(QLabel("Overlay Size (width):"))
+        size_layout.addWidget(QLabel("Size:"))
         self.webcam_size_spinbox = QSpinBox()
         self.webcam_size_spinbox.setRange(100, 640)
         self.webcam_size_spinbox.setValue(240)
@@ -504,21 +559,19 @@ class ScreenRecorderPro(QMainWindow):
         size_layout.addStretch()
         webcam_layout.addLayout(size_layout)
 
-        # Preview button
         preview_btn_layout = QHBoxLayout()
-        self.preview_btn = QPushButton("Preview Webcam")
-        self.preview_btn.clicked.connect(self.preview_webcam)
-        preview_btn_layout.addWidget(self.preview_btn)
+        preview_btn = QPushButton("Preview Webcam")
+        preview_btn.clicked.connect(self.preview_webcam)
+        preview_btn_layout.addWidget(preview_btn)
         preview_btn_layout.addStretch()
         webcam_layout.addLayout(preview_btn_layout)
 
         webcam_group.setLayout(webcam_layout)
-        main_layout.addWidget(webcam_group)
+        left_layout.addWidget(webcam_group)
 
-        # Status
+        # --- Status ---
         status_group = QGroupBox("Status")
         status_layout = QVBoxLayout()
-
         self.status_label = QLabel("Ready to record")
         status_layout.addWidget(self.status_label)
 
@@ -532,147 +585,210 @@ class ScreenRecorderPro(QMainWindow):
         status_layout.addWidget(self.frame_count_label)
 
         status_group.setLayout(status_layout)
-        main_layout.addWidget(status_group)
+        left_layout.addWidget(status_group)
 
-        # Control buttons
-        button_layout = QHBoxLayout()
-
+        # Record button
         self.record_btn = QPushButton("Start Recording")
-        self.record_btn.setMinimumHeight(50)
+        self.record_btn.setMinimumHeight(45)
         self.record_btn.setStyleSheet("""
             QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-                border-radius: 5px;
+                background-color: #4CAF50; color: white;
+                font-size: 14px; font-weight: bold; border-radius: 5px;
             }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
+            QPushButton:hover { background-color: #45a049; }
+            QPushButton:disabled { background-color: #cccccc; }
         """)
         self.record_btn.clicked.connect(self.toggle_recording)
-        button_layout.addWidget(self.record_btn)
+        left_layout.addWidget(self.record_btn)
 
-        main_layout.addLayout(button_layout)
-        main_layout.addStretch()
+        left_layout.addStretch()
+
+        # ===== Right panel: live preview =====
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+
+        preview_title = QLabel("Live Preview")
+        preview_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_font = QFont()
+        preview_font.setPointSize(12)
+        preview_font.setBold(True)
+        preview_title.setFont(preview_font)
+        right_layout.addWidget(preview_title)
+
+        self.preview_label = QLabel("Preview will appear\nwhen recording starts")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumSize(480, 360)
+        self.preview_label.setStyleSheet(
+            "background-color: #1a1a2e; color: #888; "
+            "border: 2px solid #333; border-radius: 8px; "
+            "font-size: 14px;"
+        )
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_layout.addWidget(self.preview_label, 1)
+
+        right_layout.addStretch()
+
+        # Assemble
+        main_layout.addWidget(left_panel)
+        main_layout.addWidget(right_panel, 1)
+
+        # Initial state
+        self.on_capture_mode_changed(0)
+        self.refresh_windows()
+
+    # ---- Capture mode ----
+
+    def on_capture_mode_changed(self, index):
+        mode = self.capture_mode_combo.currentText()
+        self.region = None
+        self._selected_window_rect = None
+
+        if mode == "Full Screen":
+            self.window_row.hide()
+            self.region_btn.hide()
+            self.region_label.setText("Full Screen")
+        elif mode == "Custom Region":
+            self.window_row.hide()
+            self.region_btn.show()
+            self.region_label.setText("Click 'Select Region'")
+        elif mode == "Window Capture":
+            self.window_row.show()
+            self.region_btn.show()
+            self.region_label.setText("Select window above, or crop region")
+
+    def refresh_windows(self):
+        self.window_combo.clear()
+        windows = get_visible_windows()
+        for w in windows:
+            # Truncate long titles for display
+            title = w['title']
+            if len(title) > 60:
+                title = title[:57] + "..."
+            self.window_combo.addItem(title, w['hwnd'])
+        if self.window_combo.count() == 0:
+            self.window_combo.addItem("(No windows found)", None)
+
+    def _get_selected_window_rect(self):
+        hwnd = self.window_combo.currentData()
+        if hwnd is None:
+            return None
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        if w > 0 and h > 0:
+            return (rect.left, rect.top, w, h)
+        return None
+
+    # ---- Actions ----
 
     def browse_file(self):
-        """Open folder dialog to select save location"""
-        folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "Select Save Folder",
-            ""
-        )
-
+        folder_path = QFileDialog.getExistingDirectory(self, "Select Save Folder", "")
         if folder_path:
             self.output_folder = folder_path
             self.path_label.setText(folder_path)
 
     def select_region(self):
-        """Open region selector"""
         self.region = None
-        self.region_label.setText("Full Screen")
-
+        mode = self.capture_mode_combo.currentText()
+        if mode == "Full Screen":
+            self.region_label.setText("Full Screen")
+            return
         selector = RegionSelector()
         selector.region_selected.connect(self.on_region_selected)
         selector.showFullScreen()
 
     def on_region_selected(self, region):
-        """Handle region selection"""
+        mode = self.capture_mode_combo.currentText()
         self.region = region
-        self.region_label.setText(f"Custom: {region[2]}x{region[3]}")
+        self.region_label.setText(f"Region: {region[2]}x{region[3]}")
 
     def preview_webcam(self):
-        """Open webcam preview dialog"""
         dialog = WebcamPreviewDialog(self)
         dialog.exec()
 
+    # ---- Recording ----
+
     def toggle_recording(self):
-        """Start or stop recording"""
         if self.recording_thread and self.recording_thread.isRunning():
             self.stop_recording()
         else:
             self.start_recording()
 
     def start_recording(self):
-        """Start screen recording"""
-        # Validate output folder
         if not self.output_folder:
             self.browse_file()
             if not self.output_folder:
                 return
 
-        # Generate filename with timestamp
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_path = f"{self.output_folder}/recording_{timestamp}.mp4"
         self.current_output_path = output_path
 
-        # Get settings
         fps = self.fps_spinbox.value()
         codec = self.codec_combo.currentText()
         record_audio = self.audio_checkbox.isChecked()
         webcam_enabled = self.webcam_checkbox.isChecked()
-        webcam_position = self.webcam_pos_combo.currentText().lower().replace("-", "-")
+        webcam_position = self.webcam_pos_combo.currentText().lower().replace(" ", "-")
         webcam_size = self.webcam_size_spinbox.value()
 
-        # Setup audio path
+        # Determine capture parameters based on mode
+        mode = self.capture_mode_combo.currentText()
+        window_rect = None
+        region = None
+
+        if mode == "Custom Region":
+            if self.region is None:
+                QMessageBox.warning(self, "PyRecorder", "Please select a region first.")
+                return
+            region = self.region
+        elif mode == "Window Capture":
+            window_rect = self._get_selected_window_rect()
+            if window_rect is None:
+                QMessageBox.warning(self, "PyRecorder", "Please select a window first.")
+                return
+            if self.region:
+                region = self.region
+
         if record_audio:
             base_path = os.path.splitext(output_path)[0]
             self.audio_path = f"{base_path}_audio.wav"
         else:
             self.audio_path = None
 
-        # Build status text
         status_parts = []
         if record_audio:
             status_parts.append("audio")
         if webcam_enabled:
             status_parts.append("webcam")
+        if mode == "Window Capture":
+            status_parts.append("window")
+        elif mode == "Custom Region":
+            status_parts.append("region")
         status_suffix = f" ({' + '.join(status_parts)})" if status_parts else ""
 
-        # Update UI
         self.record_btn.setText("Stop Recording")
         self.record_btn.setStyleSheet("""
             QPushButton {
-                background-color: #f44336;
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-                border-radius: 5px;
+                background-color: #f44336; color: white;
+                font-size: 14px; font-weight: bold; border-radius: 5px;
             }
-            QPushButton:hover {
-                background-color: #da190b;
-            }
+            QPushButton:hover { background-color: #da190b; }
         """)
         self.status_label.setText(f"Recording...{status_suffix}")
         self.progress_bar.setMaximum(0)
         self.progress_bar.setMinimum(0)
+        self.preview_label.setText("Starting...")
 
-        # Disable settings during recording
-        self.fps_spinbox.setEnabled(False)
-        self.codec_combo.setEnabled(False)
-        self.audio_checkbox.setEnabled(False)
-        self.webcam_checkbox.setEnabled(False)
-        self.webcam_pos_combo.setEnabled(False)
-        self.webcam_size_spinbox.setEnabled(False)
+        self._set_controls_enabled(False)
 
-        # Start recording thread
         self.recording_thread = RecordingThread(
-            output_path,
-            fps,
-            codec,
-            self.region,
-            record_audio,
-            self.audio_path,
-            webcam_enabled,
-            webcam_position,
-            webcam_size
+            output_path, fps, codec, region, record_audio, self.audio_path,
+            webcam_enabled, webcam_position, webcam_size,
+            window_hwnd=None, window_rect=window_rect
         )
         self.recording_thread.progress.connect(self.update_progress)
+        self.recording_thread.preview_frame.connect(self.update_preview)
         self.recording_thread.finished.connect(self.recording_finished)
         self.recording_thread.error.connect(self.recording_error)
         self.recording_thread.start()
@@ -680,71 +796,68 @@ class ScreenRecorderPro(QMainWindow):
         self.start_time = datetime.now()
 
     def stop_recording(self):
-        """Stop screen recording"""
         if self.recording_thread:
             self.status_label.setText("Stopping...")
             self.recording_thread.stop()
 
     def update_progress(self, frame_count):
-        """Update recording progress"""
         self.frame_count_label.setText(f"Frames: {frame_count}")
-
         if self.start_time:
             elapsed = (datetime.now() - self.start_time).total_seconds()
             self.status_label.setText(f"Recording... ({elapsed:.0f}s)")
 
+    def update_preview(self, qimg):
+        pixmap = QPixmap.fromImage(qimg).scaled(
+            self.preview_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        self.preview_label.setPixmap(pixmap)
+
     def recording_finished(self):
-        """Handle recording completion"""
         self.record_btn.setText("Start Recording")
         self.record_btn.setStyleSheet("""
             QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-                border-radius: 5px;
+                background-color: #4CAF50; color: white;
+                font-size: 14px; font-weight: bold; border-radius: 5px;
             }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
+            QPushButton:hover { background-color: #45a049; }
         """)
-
-        # Re-enable settings
-        self.fps_spinbox.setEnabled(True)
-        self.codec_combo.setEnabled(True)
-        self.audio_checkbox.setEnabled(True)
-        self.webcam_checkbox.setEnabled(True)
-        self.webcam_pos_combo.setEnabled(True)
-        self.webcam_size_spinbox.setEnabled(True)
+        self._set_controls_enabled(True)
 
         if self.start_time:
             elapsed = (datetime.now() - self.start_time).total_seconds()
             self.status_label.setText(f"Saved! Duration: {elapsed:.1f}s")
 
             QMessageBox.information(
-                self,
-                "PyRecorder - Recording Complete",
+                self, "PyRecorder - Recording Complete",
                 f"Recording saved to:\n{self.current_output_path}\n\n"
                 f"Total frames: {self.frame_count_label.text().split(': ')[1]}\n"
                 f"Duration: {elapsed:.1f} seconds"
             )
 
+        self.preview_label.setText("Recording saved.\nStart a new recording to preview.")
+
     def recording_error(self, error_msg):
-        """Handle recording error"""
-        QMessageBox.critical(
-            self,
-            "PyRecorder - Error",
-            f"An error occurred during recording:\n{error_msg}"
-        )
+        QMessageBox.critical(self, "PyRecorder - Error", f"Recording error:\n{error_msg}")
+
+    def _set_controls_enabled(self, enabled):
+        self.fps_spinbox.setEnabled(enabled)
+        self.codec_combo.setEnabled(enabled)
+        self.audio_checkbox.setEnabled(enabled)
+        self.webcam_checkbox.setEnabled(enabled)
+        self.webcam_pos_combo.setEnabled(enabled)
+        self.webcam_size_spinbox.setEnabled(enabled)
+        self.capture_mode_combo.setEnabled(enabled)
+        self.window_combo.setEnabled(enabled)
+        self.region_btn.setEnabled(enabled)
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-
     recorder = ScreenRecorderPro()
     recorder.show()
-
     sys.exit(app.exec())
 
 
