@@ -232,6 +232,48 @@ python -m imageio_download_bin
 └──────────────────────────────────────────────────────────┘
 ```
 
+## 🍎 macOS 支持（新版）
+
+`screen_recorder_mac.py` 是 macOS 原生支持版本：**屏幕 + 人像画中画 + 麦克风**同时录制，由 ffmpeg + AVFoundation 采集、VideoToolbox **硬件编码**，CPU 占用低、文件小（约 10MB/min @1080p30），直接输出 H.264 MP4，无需后期合并。
+
+### 安装
+
+```bash
+# 1. 安装 ffmpeg（唯一系统依赖）
+brew install ffmpeg
+
+# 2. 安装 Python 依赖（仅需 PyQt6）
+python3 -m pip install -r requirements-mac.txt
+# （依赖 PyQt6 + opencv-python；摄像头由 OpenCV 的 AVFoundation 路径采集，
+#   规避了 ffmpeg 摄像头输入在部分设备上输出冻结帧的问题）
+
+# 3. 运行
+python3 screen_recorder_mac.py
+# 或在 Finder 中双击 start.command
+```
+
+### 首次运行：授予权限（重要）
+
+在「系统设置 → 隐私与安全性」中，为**运行 PyRecorder 的程序**（终端 / iTerm / PyRecorder.app）开启：
+
+- **屏幕录制** — 不授权会录到黑屏或空文件
+- **相机** — 开启人像画中画时需要
+- **麦克风** — 开启录音时需要
+
+授权后需重启终端/应用才会生效。
+
+### 功能
+
+- 全屏 / 自定义区域录制（拖拽框选）
+- 摄像头实时气泡：点击 **Preview & Position** 弹出置顶摄像头气泡，实时预览画面；**拖拽移动、右下角拉边缩放（锁定 16:9，另有 +/− 按钮档位缩放）**，气泡所在位置和大小即录制时的画中画位置和大小
+- 布局可选：角落画中画，或**演讲者模式**（Speaker Left/Right，人像竖条与屏幕内容并排，参考腾讯会议分享屏幕演讲者模式）
+- 文件输出：合并后的 `recording_xxx.mp4`，可同时勾选保存**分开的纯屏幕**（`_screen.mp4`）与**纯人像**（`_camera.mp4`）文件
+- 录制中的 **Live Preview** 置顶窗口：实时看到「屏幕+人像」合成后的最终效果
+- 麦克风录音（10–60 FPS，默认 30）
+- 输出保存到 `~/Movies`（可自定义），文件名 `recording_YYYYMMDD_HHMMSS.mp4`
+
+> 说明：macOS 系统限制，**系统内部声音**无法直接录制；如需内录系统声音，可安装虚拟声卡 [BlackHole](https://existential.audio/blackhole/) 后将输入设备切换为 BlackHole。
+
 ## 许可证
 
 MIT License
