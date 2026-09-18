@@ -245,3 +245,42 @@ def test_recording_succeeded_rejects_killed_processes_and_missing_files(tmp_path
     empty = tmp_path / "empty.mp4"
     empty.write_bytes(b"")
     assert mac.recording_succeeded(255, str(empty)) is False
+
+
+# --------------------------------------------------------------------------
+# paced camera writes: the pipe has no timestamps, so ffmpeg derives them from
+# the declared rate. If the writer does not honour that rate, the camera-only
+# file ends up shorter than the composite (measured: 6.37s vs 9.03s).
+# --------------------------------------------------------------------------
+
+def test_frames_due_waits_when_it_is_not_time_yet():
+    n, nxt = mac.frames_due(next_due=1.0, now=0.99, interval=1 / 30)
+    assert n == 0
+    assert nxt == 1.0
+
+
+def test_frames_due_emits_one_frame_on_schedule():
+    n, nxt = mac.frames_due(next_due=0.0, now=0.0, interval=1 / 30)
+    assert n == 1
+    assert nxt == pytest.approx(1 / 30)
+
+
+def test_frames_due_duplicates_when_the_device_delivers_too_slowly():
+    # 0.1s elapsed at a declared 30fps -> 4 writes (3 intervals + the due one)
+    n, nxt = mac.frames_due(next_due=0.0, now=0.1, interval=1 / 30)
+    assert n == 4
+    assert nxt == pytest.approx(4 / 30)
+
+
+def test_frames_due_resyncs_instead_of_bursting_after_a_stall():
+    n, nxt = mac.frames_due(next_due=0.0, now=5.0, interval=1 / 30, max_catchup=0.5)
+    assert n == 1, "must not emit 151 duplicate frames after a stall"
+    assert nxt == pytest.approx(5.0 + 1 / 30)
+
+
+def test_frames_due_stays_on_a_steady_clock_over_many_frames():
+    due, interval, written = 0.0, 1 / 30, 0
+    for step in range(90):                     # 3 seconds at 30fps
+        n, due = mac.frames_due(due, step * interval, interval)
+        written += n
+    assert written == 90

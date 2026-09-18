@@ -10,8 +10,6 @@ import pytest
 
 pytest.importorskip("PyQt6", reason="screen_recorder_mac imports PyQt6 at module level")
 
-from PyQt6.QtWidgets import QApplication  # noqa: E402
-
 import screen_recorder_mac as mac  # noqa: E402
 
 
@@ -52,19 +50,6 @@ class FakeProc:
         self.alive = False
         self.returncode = 255
         return 255
-
-
-_APP = None          # keep a reference so PyQt does not collect the app object
-
-
-@pytest.fixture()
-def recorder():
-    global _APP
-    _APP = QApplication.instance() or QApplication([])
-    rec = mac.ScreenRecorderMac()
-    rec.proc = None
-    yield rec
-    rec.proc = None
 
 
 def test_stop_recording_signals_ffmpeg_and_never_touches_stdin(recorder):

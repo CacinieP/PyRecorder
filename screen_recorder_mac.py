@@ -29,14 +29,14 @@ def ffmpeg_available():
     return shutil.which("ffmpeg") is not None or os.path.exists(FFMPEG)
 
 
-def parse_av_devices(text):
-    """Parse `ffmpeg -f avfoundation -list_devices true` stderr output.
+def parse_av_device_lists(text):
+    """Parse avfoundation `-list_devices` output into (screens, cameras, mics).
 
-    Returns (screen_index, camera_index, mic_index); an entry is None when that
-    device class is absent. The first device of each class wins — there is no
-    in-app device chooser, so e.g. BlackHole cannot be selected from the UI.
+    Each is a list of (index, name) in the order ffmpeg reported them, so the UI
+    can offer every audio input (e.g. BlackHole for system audio) instead of
+    silently hard-coding the first one.
     """
-    screen = camera = mic = None
+    screens, cameras, mics = [], [], []
     section = "video"
     for line in (text or "").splitlines():
         if "AVFoundation video devices" in line:
@@ -48,18 +48,28 @@ def parse_av_devices(text):
         m = re.search(r"\[(\d+)\]\s+(.+)$", line.strip())
         if not m:
             continue
-        idx, name = int(m.group(1)), m.group(2)
-        if "Capture screen" in name and screen is None:
-            screen = idx
-        elif section == "video" and camera is None and "Capture screen" not in name:
-            camera = idx
-        elif section == "audio" and mic is None:
-            mic = idx
-    return screen, camera, mic
+        idx, name = int(m.group(1)), m.group(2).strip()
+        if section == "audio":
+            mics.append((idx, name))
+        elif "Capture screen" in name:
+            screens.append((idx, name))
+        else:
+            cameras.append((idx, name))
+    return screens, cameras, mics
 
 
-def list_av_devices():
-    """Return (screen_index, camera_index, mic_index) from avfoundation."""
+def _first(devices):
+    return devices[0][0] if devices else None
+
+
+def parse_av_devices(text):
+    """(screen_index, camera_index, mic_index) — the first of each class."""
+    screens, cameras, mics = parse_av_device_lists(text)
+    return _first(screens), _first(cameras), _first(mics)
+
+
+def list_all_av_devices():
+    """(screens, cameras, mics) as lists of (index, name) from avfoundation."""
     try:
         proc = subprocess.run(
             [FFMPEG, "-hide_banner", "-f", "avfoundation", "-list_devices",
@@ -67,8 +77,55 @@ def list_av_devices():
             capture_output=True, text=True, timeout=20,
         )
     except Exception:
-        return None, None, None
-    return parse_av_devices(proc.stderr)
+        return [], [], []
+    return parse_av_device_lists(proc.stderr)
+
+
+def list_av_devices():
+    """Return (screen_index, camera_index, mic_index) from avfoundation."""
+    screens, cameras, mics = list_all_av_devices()
+    return _first(screens), _first(cameras), _first(mics)
+
+
+def probe_audio_device(mic_idx, ffmpeg=None, timeout=10):
+    """True when ffmpeg can actually open this audio input device.
+
+    Appearing in the device list is not enough: with Microphone permission
+    denied (or the device busy) avfoundation fails to open it, and because audio
+    shares the recording command the *whole* capture would die. Probing first
+    lets the recorder degrade to video-only with a warning. Costs ~0.4s; an
+    invalid index exits 251 with "Invalid audio device index".
+    """
+    if mic_idx is None:
+        return False
+    ff = ffmpeg or FFMPEG
+    try:
+        proc = subprocess.run(
+            [ff, "-hide_banner", "-loglevel", "error", "-f", "avfoundation",
+             "-i", f":{mic_idx}", "-t", "0.2", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
+def frames_due(next_due, now, interval, max_catchup=0.5):
+    """(copies_to_write, new_next_due) for a writer pacing to `interval`.
+
+    The camera pipe carries no timestamps — ffmpeg derives them from the
+    declared framerate — so the writer must honour that rate exactly or the
+    camera-only file ends up shorter than the composite. Duplicates the last
+    frame when the device is slow, drops frames when it is fast, and resyncs
+    with a single frame instead of bursting after a stall.
+    """
+    if now < next_due:
+        return 0, next_due
+    backlog = now - next_due
+    if backlog > max_catchup:
+        return 1, now + interval
+    n = int(backlog // interval) + 1
+    return n, next_due + n * interval
 
 
 PREVIEW_W, PREVIEW_H = 640, 360
@@ -433,7 +490,6 @@ class CameraPipeFeed(QThread):
 
     def run(self):
         import cv2
-        import time
         try:
             cap = cv2.VideoCapture(self.camera_idx, cv2.CAP_AVFOUNDATION)
             if cap.isOpened():
@@ -443,17 +499,28 @@ class CameraPipeFeed(QThread):
                 self.failed.emit("Camera opened by recorder failed.")
                 return
             target = (1920, 1080)
+            # ffmpeg timestamps this pipe from the declared framerate alone, so
+            # write on exactly that clock (duplicating when the device is slow).
+            interval = 1.0 / (self.fps or 30)
+            next_due = time.monotonic()
+            last = None
             while not self._stop:
                 ret, frame = cap.read()
-                if not ret:
-                    time.sleep(0.05)
+                if ret:
+                    if frame.shape[1] != target[0] or frame.shape[0] != target[1]:
+                        frame = cv2.resize(frame, target)
+                    last = frame
+                if last is None:
                     continue
-                if frame.shape[1] != target[0] or frame.shape[0] != target[1]:
-                    frame = cv2.resize(frame, target)
-                try:
-                    os.write(self.write_fd, frame.tobytes())
-                except OSError:
-                    break  # reader gone — recording stopped
+                due, next_due = frames_due(next_due, time.monotonic(), interval)
+                if not due:
+                    continue
+                payload = last.tobytes()
+                for _ in range(due):
+                    try:
+                        os.write(self.write_fd, payload)
+                    except OSError:
+                        return  # reader gone — recording stopped
             cap.release()
         finally:
             try:
@@ -749,6 +816,7 @@ class ScreenRecorderMac(QMainWindow):
 
         # Options
         opt_group = QGroupBox("Options")
+        opt_stack = QVBoxLayout()
         opt_layout = QHBoxLayout()
         self.mic_checkbox = QCheckBox("Microphone")
         self.mic_checkbox.setChecked(True)
@@ -761,7 +829,19 @@ class ScreenRecorderMac(QMainWindow):
         opt_layout.addStretch()
         self.separate_checkbox = QCheckBox("Also save separate screen & camera files")
         opt_layout.addWidget(self.separate_checkbox)
-        opt_group.setLayout(opt_layout)
+        opt_stack.addLayout(opt_layout)
+
+        # Every audio input ffmpeg can see, so a virtual device (BlackHole) can
+        # be chosen for system audio instead of only the first microphone.
+        mic_row = QHBoxLayout()
+        mic_row.addWidget(QLabel("Audio input:"))
+        self.mic_combo = QComboBox()
+        self.mic_combo.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                     QSizePolicy.Policy.Preferred)
+        mic_row.addWidget(self.mic_combo, 1)
+        opt_stack.addLayout(mic_row)
+
+        opt_group.setLayout(opt_stack)
         layout.addWidget(opt_group)
 
         # Status
@@ -791,12 +871,37 @@ class ScreenRecorderMac(QMainWindow):
                 "Then restart PyRecorder.")
             self.status_label.setText("ffmpeg missing")
             return
-        self.screen_idx, self.camera_idx, self.mic_idx = list_av_devices()
+        screens, cameras, mics = list_all_av_devices()
+        self.screen_idx = _first(screens)
+        self.camera_idx = _first(cameras)
+        self.mic_idx = _first(mics)
+        self._populate_mic_combo(mics)
         parts = []
         parts.append("screen OK" if self.screen_idx is not None else "screen NOT found")
         parts.append("camera OK" if self.camera_idx is not None else "no camera")
         parts.append("mic OK" if self.mic_idx is not None else "no mic")
         self.status_label.setText("Devices: " + ", ".join(parts))
+
+    def _populate_mic_combo(self, devices):
+        """Fill the audio-input chooser, keeping the current pick if it survives."""
+        previous = self.mic_combo.currentData()
+        self.mic_combo.blockSignals(True)
+        self.mic_combo.clear()
+        for idx, name in devices:
+            self.mic_combo.addItem(f"{name}  [{idx}]", idx)
+        if previous is not None:
+            at = self.mic_combo.findData(previous)
+            if at >= 0:
+                self.mic_combo.setCurrentIndex(at)
+        self.mic_combo.blockSignals(False)
+
+    def selected_mic_index(self):
+        """avfoundation index of the chosen audio input, or None when there is
+        no device / no chooser yet."""
+        if self.mic_combo.count() == 0:
+            return None
+        data = self.mic_combo.currentData()
+        return self.mic_idx if data is None else data
 
     # ---- actions ----
 
@@ -878,7 +983,15 @@ class ScreenRecorderMac(QMainWindow):
         scale = screen.devicePixelRatio() or 1.0
 
         cam_on = self.cam_checkbox.isChecked() and self.camera_idx is not None
-        mic_on = self.mic_checkbox.isChecked() and self.mic_idx is not None
+        mic_idx = self.selected_mic_index()
+        mic_on = self.mic_checkbox.isChecked() and mic_idx is not None
+        if mic_on and not probe_audio_device(mic_idx):
+            QMessageBox.warning(
+                self, "PyRecorder",
+                "Microphone is unavailable — recording video only.\n\n"
+                "Grant access in System Settings → Privacy & Security → "
+                "Microphone, or pick another Audio input, then start again.")
+            mic_on = False
 
         # PiP rect: prefer the preview bubble's on-screen geometry; otherwise
         # default to bottom-right corner at the default size.
@@ -936,7 +1049,7 @@ class ScreenRecorderMac(QMainWindow):
 
         cmd, self.extra_files = build_command(
             self.output_path, self.fps_spin.value(),
-            self.screen_idx, self.mic_idx, self.camera_idx,
+            self.screen_idx, mic_idx, self.camera_idx,
             mic_on, cam_on, pip,
             region=self.region, screen_scale=scale,
             layout=("pip", "speaker-right", "speaker-left")[
@@ -967,7 +1080,7 @@ class ScreenRecorderMac(QMainWindow):
         self.cam_feed = None
         if cam_pipe_fd is not None:
             self.cam_feed = CameraPipeFeed(self.camera_idx, self._cam_pipe_write_fd,
-                                           self.fps_spin.value())
+                                           cam_fps or self.fps_spin.value())
             self.cam_feed.failed.connect(
                 lambda m: self.status_label.setText("Camera feed: " + m))
             self.cam_feed.start()
@@ -1104,6 +1217,7 @@ class ScreenRecorderMac(QMainWindow):
         self.layout_combo.setEnabled(enabled)
         self.separate_checkbox.setEnabled(enabled)
         self.mic_checkbox.setEnabled(enabled)
+        self.mic_combo.setEnabled(enabled)
         self.fps_spin.setEnabled(enabled)
         self.region_btn.setEnabled(enabled)
         self.clear_region_btn.setEnabled(enabled)

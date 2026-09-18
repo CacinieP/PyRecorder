@@ -52,9 +52,12 @@
 - **演讲者模式（Speaker Left / Right）**：人像与屏幕内容**等高（均缩放到 1080 高）横向并排**，各自保留原宽高比（实测本机：屏幕 1726×1080 + 人像 1920×1080 → 合成 3646×1080），参考腾讯会议「演讲者模式」；此布局下气泡位置/大小不生效
 - **Live Preview**：录制期间自动弹出置顶窗口显示合成后的最终画面（无开关，恒定开启）；预览流固定 letterbox 到 **480×270**，因此任何布局下都不会错位
 - **分轨保存**（可选）：除合成的 `recording_*.mp4` 外，另存纯屏幕 `_screen.mp4`（8 Mbit/s，**与主文件同区域**）与纯人像 `_camera.mp4`（2 Mbit/s）
+- **音频输入可选**：`Options → Audio input` 下拉列出 ffmpeg 看到的全部 avfoundation 音频设备（含 BlackHole 之类虚拟声卡），不再固定用列表里的第一个
+- **麦克风探测与降级**：开始录制前用 `ffmpeg -i ":<index>" -t 0.2` 实探一次（约 0.4s）；打不开就弹窗提示并**自动降级为仅视频**，而不是让整条命令失败
 - 麦克风开关、FPS 10–60（默认 30）、输出目录可选（默认 `~/Movies`）
 - 摄像头由 **OpenCV 的 AVFoundation 路径**采集后通过管道喂给 ffmpeg，绕开 ffmpeg 自带摄像头输入在部分设备上输出冻结帧的问题；录制前会先探测摄像头，不可用时弹窗降级为「仅屏幕（+麦克风）」
-- 摄像头不可用时不影响录屏；**麦克风没有探测与降级逻辑**（设备存在即写入命令）
+- 摄像头与麦克风都不可用时均不影响录屏：两者都会探测、弹窗、降级
+- **摄像头写入按声明帧率节流**（`frames_due()`：设备慢就补帧、快就丢帧、卡顿后重新对齐而不是突然爆发），使分轨的 `_camera.mp4` 与合成文件时长基本一致
 
 ## 安装与运行
 
@@ -102,7 +105,7 @@ python3 screen_recorder_mac.py
 |---|---|---|
 | 屏幕录制 | 始终 | 录到黑屏 / 空文件，或找不到屏幕采集设备 |
 | 相机 | 勾选人像 PiP 时 | 摄像头探测失败，自动降级为仅屏幕 |
-| 麦克风 | 勾选 Microphone 时 | ffmpeg 打开音频设备失败，**整条命令失败** |
+| 麦克风 | 勾选 Microphone 时 | 探测失败 → 弹窗提示并自动降级为仅视频（不再是整条命令失败） |
 
 授权后必须重启终端 / 应用才生效。找不到屏幕设备时程序会弹出带上述路径的提示。
 
@@ -114,7 +117,7 @@ python3 screen_recorder_mac.py
 2. （可选）`Select Region` 拖拽框选区域，`Clear` 恢复全屏
 3. 勾选 `Record camera overlay` → 点 `Preview & Position` → **把气泡拖到想要的位置、拉到想要的大小**
 4. `Layout` 选择 Corner PiP 或 Speaker Left/Right
-5. 按需勾选 `Microphone`、`Also save separate screen & camera files`，设置 FPS
+5. 按需勾选 `Microphone`，在 `Audio input` 下拉选择音频设备（默认第一个；录系统声音可选 BlackHole），再勾选 `Also save separate screen & camera files`、设置 FPS
 6. `Start Recording` → 弹出 Live Preview 置顶窗口 → `Stop Recording` 结束，弹窗列出保存的文件
 
 ### Windows Pro
@@ -191,12 +194,12 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 5. ✅ **分轨 `_screen.mp4` 录的是全屏而非所选区域**
    原因：滤镜图先 `split` 后 `crop`，实测区域录制时主文件 1280×960 而 `_screen.mp4` 是 2816×1762。修复：改为先 `crop` 后 `split`，复测两者均为 1280×960。
 
-6. ⚠️ **分轨 `_camera.mp4` 比主文件短**（部分改善）
-   修复前实测主文件 9.03s / `_camera.mp4` 6.37s（70%）；修复后 5.63s vs 4.90s（87%）。差异来自摄像头交付帧数略少于屏幕，尚未做时长对齐。
+6. ✅ **分轨 `_camera.mp4` 比主文件短**（已基本对齐）
+   原因：管道输入没有自己的时间戳，ffmpeg 完全按声明帧率推算，而 feeder 原本是「摄像头给多快就写多快」。实测演进：未处理时主文件 9.03s / `_camera.mp4` 6.37s（短 30%）；仅修声明帧率后 5.63s vs 4.90s（短 13%）；加上 `frames_due()` 节流后 **5.44s vs 5.10s（差 0.34s）**，另一次 **5.07s vs 5.13s（差 −0.07s）**；`_screen.mp4` 与主文件差 0.00–0.04s。仍非逐帧精确（停止时不补尾帧）。
 
-7. ⚠️ **其他实现层面的限制（未改）**
-   - 麦克风没有探测/降级：只判断设备是否存在，权限或设备异常时整条 ffmpeg 命令失败（摄像头有 `_camera_probe()`）
-   - 音频设备固定取 avfoundation 列表第一个，界面无设备选择 → 「装 BlackHole 后切换输入」无法通过界面完成
+7. ⚠️ **其他实现层面的限制**（麦克风探测与音频设备选择本轮已补，见下）
+   - ✅ 麦克风探测/降级：已加 `probe_audio_device()`，打不开就弹窗并降级为仅视频。实测把设备指向不存在的索引 99 → 弹出 `Microphone is unavailable — recording video only`，仍产出 5.53s 纯视频可播放文件，无错误弹窗
+   - ✅ 音频设备可选：`Audio input` 下拉列出全部 avfoundation 音频设备（`parse_av_device_lists()`），录制时使用所选索引，重新探测时保留上次选择；BlackHole 因此可以在界面里选中（本次实测的是下拉能选中任意索引，未实装 BlackHole）
    - `_camera_probe()` 在 GUI 线程内阻塞约 0.7–1s；`probe_devices()` 的 `-list_devices` 同样在主线程
    - `stderr` 用 PIPE 但录制期间不读取（实测 30 秒约 1KB，短期无溢出风险）
    - 非 16:9 摄像头会被拉伸到 1920×1080；仅支持主显示器；录制中部分控件仍可点
@@ -232,22 +235,24 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 
 | 文件 | 改动 |
 |---|---|
-| `screen_recorder_mac.py` | 每个输出加 `-r`；预览固定 480×270 letterbox；停止改为单次 SIGTERM + moov 校验；摄像头实测帧率；先 crop 后 split；关闭泄漏的管道 fd；抽出 `parse_av_devices()` / `estimate_fps()` / `pick_camera_fps()` / `recording_succeeded()` / `_mp4_has_moov()` 便于测试 |
+| `screen_recorder_mac.py` | 每个输出加 `-r`；预览固定 480×270 letterbox；停止改为单次 SIGTERM + moov 校验；摄像头实测帧率 + `frames_due()` 节流写入；先 crop 后 split；关闭泄漏的管道 fd；新增音频输入下拉与 `probe_audio_device()` 降级；抽出 `parse_av_device_lists()` / `estimate_fps()` / `pick_camera_fps()` / `frames_due()` / `probe_audio_device()` / `recording_succeeded()` / `_mp4_has_moov()` 便于测试 |
 | `screen_recorder_pro.py` | moviepy 2.x API；抽出 `merge_audio_video()`；流式写 wav；平台守卫 + 惰性导入；`img` 判空 |
 | `requirements.txt` / `requirements-mac.txt` | `moviepy==1.0.3` → `moviepy>=2.0`；`PyQt6==6.6.1` → `PyQt6>=6.7,<7`（6.6.x 不锁 `PyQt6-Qt6` 上界，全新安装会 ImportError） |
-| `tests/` | 新增 34 个用例 |
+| `tests/` | 新增 52 个用例 |
 | `.github/workflows/ci.yml` | 显式安装 pytest 与系统库，去掉三处 `\|\| true`，让测试/lint 真正阻断 |
 
 ## 测试
 
 ```bash
 pip install PyQt6 opencv-python numpy mss pytest "moviepy>=2"
-pytest -q          # 34 passed
+pytest -q          # 52 passed（ubuntu CI 上为 51 passed, 1 skipped：无效音频索引那条只在 macOS 跑）
 ```
 
 - `tests/test_mac_command.py` — ffmpeg 命令拼装（每个输出都有 `-r`、预览固定尺寸、先 crop 后 split、分轨命名与码率、区域按 DPR 缩放、麦克风映射、Speaker 左右顺序）、avfoundation 设备列表解析（含真实 ffmpeg 8.1.2 输出与多屏/BlackHole 场景）、摄像头帧率测量与夹取、成功判定（含 moov 缺失的截断文件）
 - `tests/test_mac_stop.py` — 停止只发一次 SIGTERM、不写 stdin、`_finalize()` 不二次发信号
+- `frames_due()` 节流（在 `tests/test_mac_command.py`）— 未到点不写、准点写一帧、设备慢时补帧、卡顿后重对齐而非爆发、90 帧稳定时钟不多不少
 - `tests/test_pro_recording.py` — 非 Windows 可导入、音频边录边落盘且不再缓存内存、真实 moviepy 合并出带音轨的文件、音频长于视频时被裁剪
+- `tests/test_mac_devices.py` — 列出全部音频/摄像头/屏幕设备（含 BlackHole 在首位的多设备场景）、麦克风探测跟随 ffmpeg 退出码与设备索引（用桩脚本，跨平台）、无效索引在真机上返回 False、音频下拉的填充/选择/重列保持/录制中禁用
 - `tests/test_environment.py` — PyQt6 wrapper 与 Qt 二进制的 minor 版本一致（防止 `PyQt6==6.6.1` + `PyQt6-Qt6 6.11` 这种装得上却导入即崩的组合）、两个录制模块都能导入
 
 用例只覆盖纯逻辑与可在无头环境运行的部分。需要屏幕录制权限、真实摄像头与窗口系统的端到端验证没有做成自动用例，本次改为驱动真实 GUI 类（`ScreenRecorderMac`）人工跑过：PiP+分轨、PiP+区域+分轨、Speaker Left/Right、仅屏幕，各 6 秒会话，逐个用 ffprobe 校验时长、分辨率与音轨。
@@ -289,9 +294,9 @@ pytest -q          # 34 passed
 | 点 Stop 后弹窗 `Recording failed` | `_finalize` 要求退出码 ∈ {0,255} **且**文件含 moov atom；弹窗内会附 ffmpeg 输出末尾 800 字符 |
 | Live Preview 画面撕裂 | 曾是已知问题 3（已修复：预览固定 480×270 letterbox） |
 | 成片动作卡顿、时长略短于实际录制 | 曾是已知问题 4（已修复）；短片仍会少 0.3–0.7s 的 ffmpeg 启动时间 |
-| 勾选 Microphone 后整段录制失败 | ffmpeg 打不开音频设备（多为麦克风权限未授予）；取消勾选可继续录屏 |
+| 弹窗 `Microphone is unavailable — recording video only` | 探测到该音频设备打不开（多为麦克风权限未授予或被占用）；已自动降级为仅视频，授权后在 `Audio input` 里重选即可 |
 | 气泡里显示 `Camera unavailable` | 摄像头被其他程序占用或未授予相机权限 |
-| 想录系统内部声音 | macOS 限制，无法直接录制；需 BlackHole 等虚拟声卡，且当前版本没有音频设备选择界面（已知问题 7） |
+| 想录系统内部声音 | macOS 限制，无法直接录制；装 BlackHole 并配置「多输出设备」后，可在 `Audio input` 下拉里选中它 |
 
 ### Windows
 
