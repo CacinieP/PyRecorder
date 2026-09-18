@@ -7,4 +7,6 @@ Pillow==10.2.0
 
 # Pro版音频依赖
 pyaudio==0.2.14
-moviepy==1.0.3
+# moviepy 2.x: screen_recorder_pro 使用 with_audio()/subclipped()（1.x 的
+# set_audio()/subclip() 已移除），且 1.0.3 无法从顶层 moviepy 导入 VideoFileClip。
+moviepy>=2.0

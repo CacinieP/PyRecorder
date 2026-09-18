@@ -29,20 +29,16 @@ def ffmpeg_available():
     return shutil.which("ffmpeg") is not None or os.path.exists(FFMPEG)
 
 
-def list_av_devices():
-    """Return (screen_index, camera_index, mic_index) from avfoundation."""
-    try:
-        proc = subprocess.run(
-            [FFMPEG, "-hide_banner", "-f", "avfoundation", "-list_devices",
-             "true", "-i", ""],
-            capture_output=True, text=True, timeout=20,
-        )
-    except Exception:
-        return None, None, None
+def parse_av_devices(text):
+    """Parse `ffmpeg -f avfoundation -list_devices true` stderr output.
 
+    Returns (screen_index, camera_index, mic_index); an entry is None when that
+    device class is absent. The first device of each class wins — there is no
+    in-app device chooser, so e.g. BlackHole cannot be selected from the UI.
+    """
     screen = camera = mic = None
     section = "video"
-    for line in proc.stderr.splitlines():
+    for line in (text or "").splitlines():
         if "AVFoundation video devices" in line:
             section = "video"
             continue
@@ -62,10 +58,26 @@ def list_av_devices():
     return screen, camera, mic
 
 
+def list_av_devices():
+    """Return (screen_index, camera_index, mic_index) from avfoundation."""
+    try:
+        proc = subprocess.run(
+            [FFMPEG, "-hide_banner", "-f", "avfoundation", "-list_devices",
+             "true", "-i", ""],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:
+        return None, None, None
+    return parse_av_devices(proc.stderr)
+
+
 PREVIEW_W, PREVIEW_H = 640, 360
 # this device (and most modern cams) only delivers 1080p; request that and
 # scale down in the filter — forcing smaller sizes fails with I/O error
 CAMERA_CAPTURE_SIZE = "1920x1080"
+# The live-preview stream is letterboxed onto this fixed canvas so the reader
+# never has to guess the geometry (it used to, and got Speaker modes wrong).
+LIVE_PREVIEW_W, LIVE_PREVIEW_H = 480, 270
 
 
 class CameraFrameThread(QThread):
@@ -283,7 +295,7 @@ class PipPreviewWindow(QWidget):
 def build_command(output_path, fps, screen_idx, mic_idx, camera_idx,
                   mic_enabled, camera_enabled, pip, region=None,
                   screen_scale=1.0, layout="pip", separate=False, preview=False,
-                  camera_pipe_fd=None):
+                  camera_pipe_fd=None, camera_fps=None):
     """Assemble the ffmpeg command.
 
     region: (x, y, w, h) logical points, or None for full screen.
@@ -297,6 +309,10 @@ def build_command(output_path, fps, screen_idx, mic_idx, camera_idx,
     camera_pipe_fd: child fd that raw BGR camera frames arrive on. The frames
          are captured by OpenCV (AVFoundation), because ffmpeg's own
          avfoundation camera demuxer delivers a frozen stream on some devices.
+    camera_fps: the camera's *measured* delivery rate. The pipe input carries
+        no timestamps of its own, so whatever is declared here becomes the
+        camera clock; declaring the GUI fps while the device is slower makes
+        ffmpeg duplicate frames and the whole timeline run slow.
 
     Returns (cmd, extra_files)."""
     extra_files = []
@@ -316,25 +332,26 @@ def build_command(output_path, fps, screen_idx, mic_idx, camera_idx,
     filters = []
     base = "[0:v]"
 
-    # split screen input if it is needed both composited and as its own file
-    scr_stream = base
-    if separate:
-        filters.append(f"{base}split=2[scrA][scrB]")
-        scr_stream, base = "[scrA]", "[scrB]"
-
+    # crop first, so the screen-only file holds what was actually recorded
     if region:
         x, y, w, h = region
         x, y = int(x * screen_scale), int(y * screen_scale)
         w, h = int(w * screen_scale), int(h * screen_scale)
-        filters.append(f"{base}crop={w}:{h}:{x}:{y}[base]")
-        base = "[base]"
+        filters.append(f"{base}crop={w}:{h}:{x}:{y}[crp]")
+        base = "[crp]"
+
+    # split the (already cropped) screen if it is also wanted as its own file
+    scr_stream = base
+    if separate:
+        filters.append(f"{base}split=2[scrA][scrB]")
+        scr_stream, base = "[scrA]", "[scrB]"
 
     cam_stream = None
     if camera_enabled and camera_idx is not None and camera_pipe_fd is not None:
         cmd += [
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-video_size", CAMERA_CAPTURE_SIZE,
-            "-framerate", str(fps),
+            "-framerate", str(round(camera_fps or fps, 3)),
             "-i", f"pipe:{camera_pipe_fd}",
         ]
         cam_in = "[1:v]"
@@ -361,8 +378,11 @@ def build_command(output_path, fps, screen_idx, mic_idx, camera_idx,
         base = "[out]"
 
     if preview:
-        prev_w = 480
-        filters.append(f"{base}split=2[rec][pv];[pv]scale={prev_w}:-2[prev]")
+        filters.append(
+            f"{base}split=2[rec][pv];"
+            f"[pv]scale={LIVE_PREVIEW_W}:{LIVE_PREVIEW_H}:"
+            f"force_original_aspect_ratio=decrease,"
+            f"pad={LIVE_PREVIEW_W}:{LIVE_PREVIEW_H}:(ow-iw)/2:(oh-ih)/2[prev]")
         base = "[rec]"
 
     if filters:
@@ -372,24 +392,27 @@ def build_command(output_path, fps, screen_idx, mic_idx, camera_idx,
 
     if audio_stream:
         cmd += ["-map", audio_stream, "-c:a", "aac", "-b:a", "128k"]
+    # `-r` on every output: the avfoundation screen input reports a bogus
+    # "1000k tbr", and any output inheriting it (the rawvideo preview above all)
+    # makes ffmpeg duplicate frames without bound.
     cmd += ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-pix_fmt", "yuv420p",
-            output_path]
+            "-r", str(fps), output_path]
 
     # separate files (no re-filtering, hardware encoded)
     if separate and scr_stream:
         cmd += ["-map", scr_stream, "-c:v", "h264_videotoolbox", "-b:v", "8M",
-                "-pix_fmt", "yuv420p",
+                "-pix_fmt", "yuv420p", "-r", str(fps),
                 output_path.replace(".mp4", "_screen.mp4")]
         extra_files.append(output_path.replace(".mp4", "_screen.mp4"))
     if separate and cam_stream:
         cmd += ["-map", cam_stream, "-c:v", "h264_videotoolbox", "-b:v", "2M",
-                "-pix_fmt", "yuv420p",
+                "-pix_fmt", "yuv420p", "-r", str(fps),
                 output_path.replace(".mp4", "_camera.mp4")]
         extra_files.append(output_path.replace(".mp4", "_camera.mp4"))
 
     if preview:
         cmd += ["-map", "[prev]", "-f", "rawvideo", "-pix_fmt", "rgb24",
-                "pipe:1"]
+                "-r", str(fps), "pipe:1"]
     return cmd, extra_files
 
 
@@ -420,7 +443,6 @@ class CameraPipeFeed(QThread):
                 self.failed.emit("Camera opened by recorder failed.")
                 return
             target = (1920, 1080)
-            n = 0
             while not self._stop:
                 ret, frame = cap.read()
                 if not ret:
@@ -440,11 +462,81 @@ class CameraPipeFeed(QThread):
                 pass
 
 
-def preview_dims(region, screen_geo, scale, prev_w=480):
-    """(w, h) of the rawvideo preview stream — must match scale=W:-2."""
-    cap_w = (region[2] if region else screen_geo.width()) * scale
-    cap_h = (region[3] if region else screen_geo.height()) * scale
-    return prev_w, max(2, int(round(cap_h * prev_w / cap_w / 2)) * 2)
+def preview_dims(region=None, screen_geo=None, scale=1.0, layout="pip"):
+    """(w, h) of the rawvideo preview stream.
+
+    build_command() letterboxes the preview onto a fixed canvas, so the size no
+    longer depends on the capture region, the pixel ratio or the layout. The
+    parameters are kept for call-site compatibility.
+    """
+    return LIVE_PREVIEW_W, LIVE_PREVIEW_H
+
+
+def estimate_fps(read_frame, window=1.0, clock=time.monotonic):
+    """Measure a capture device's real delivery rate in frames/second.
+
+    read_frame() must return True when it delivered a frame. The first frame is
+    treated as warm-up (device start latency) and excluded. Returns None when
+    the device delivers too few frames to trust.
+    """
+    t0 = clock()
+    elapsed = 0.0
+    frames = 0
+    warmed = False
+    while True:
+        got = read_frame()
+        now = clock()
+        if got:
+            if warmed:
+                frames += 1
+            else:
+                warmed = True
+                t0 = now
+        elapsed = now - t0
+        if elapsed >= window:
+            break
+        if not warmed and elapsed >= window * 3:
+            break   # device never produced a frame
+    if frames < 2 or elapsed <= 0:
+        return None
+    return frames / elapsed
+
+
+def pick_camera_fps(measured, fallback, lo=5.0, hi=60.0):
+    """Clamp a measured camera rate into a usable range, else use the fallback."""
+    if not measured:
+        return float(fallback)
+    return float(min(hi, max(lo, measured)))
+
+
+def _mp4_has_moov(path, tail_bytes=4 * 1024 * 1024):
+    """True when the mp4 trailer (moov atom) was written.
+
+    ffmpeg writes moov last. A recording interrupted before the muxer finished
+    leaves plenty of mdat bytes behind but no moov, so the file has a plausible
+    size yet will not play and ffprobe reports no duration.
+    """
+    try:
+        size = os.path.getsize(path)
+        if size == 0:
+            return False
+        with open(path, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            return b"moov" in f.read()
+    except OSError:
+        return False
+
+
+def recording_succeeded(returncode, output_path):
+    """A recording is good when ffmpeg exited cleanly *and* left a playable file.
+
+    ffmpeg exits 0 after 'q' and 255 after SIGTERM; a negative code means it was
+    killed and never finalised the container. The moov check catches the case
+    where the exit code looks fine but the trailer is missing.
+    """
+    if returncode not in (0, 255):
+        return False
+    return _mp4_has_moov(output_path)
 
 
 class LivePreviewThread(QThread):
@@ -561,6 +653,7 @@ class ScreenRecorderMac(QMainWindow):
     def __init__(self):
         super().__init__()
         self.proc = None
+        self._stop_requested = False
         self.output_path = ""
         self.region = None
         self.screen_idx = self.camera_idx = self.mic_idx = None
@@ -822,10 +915,14 @@ class ScreenRecorderMac(QMainWindow):
             self.preview_btn.setChecked(False)
             self.cam_size.setEnabled(True)
 
-        # probe the camera via OpenCV; degrade to screen-only if unavailable
+        # probe the camera via OpenCV; degrade to screen-only if unavailable.
+        # The probe also measures the delivery rate the pipe must declare.
         cam_pipe_fd = None
+        cam_fps = None
         if cam_on:
-            if self._camera_probe():
+            measured = self._camera_probe()
+            if measured:
+                cam_fps = pick_camera_fps(measured, self.fps_spin.value())
                 r, w = os.pipe()
                 os.set_inheritable(r, True)
                 cam_pipe_fd = r
@@ -845,7 +942,7 @@ class ScreenRecorderMac(QMainWindow):
             layout=("pip", "speaker-right", "speaker-left")[
                 self.layout_combo.currentIndex()],
             separate=self.separate_checkbox.isChecked(),
-            preview=True, camera_pipe_fd=cam_pipe_fd)
+            preview=True, camera_pipe_fd=cam_pipe_fd, camera_fps=cam_fps)
 
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -858,6 +955,13 @@ class ScreenRecorderMac(QMainWindow):
                 os.close(self._cam_pipe_write_fd)
             QMessageBox.critical(self, "PyRecorder", f"Failed to start ffmpeg:\n{e}")
             return
+
+        # the child inherited its own copy of the read end; drop ours
+        if cam_pipe_fd is not None:
+            try:
+                os.close(cam_pipe_fd)
+            except OSError:
+                pass
 
         # OpenCV feeds the camera frames into ffmpeg's pipe
         self.cam_feed = None
@@ -888,43 +992,62 @@ class ScreenRecorderMac(QMainWindow):
         self.elapsed_timer.start(500)
 
     def _camera_probe(self):
-        """Quick OpenCV open + one frame, so a broken camera degrades to a
-        screen-only recording instead of failing the whole command."""
+        """Open the camera via OpenCV, confirm it delivers frames and measure
+        the real rate. Returns the measured fps, or None when the camera is
+        unusable so the caller degrades to a screen-only recording instead of
+        failing the whole ffmpeg command.
+
+        Measuring matters: CAP_PROP_FPS lies (reported 15 for a device that
+        really delivers 24-28), and the rate declared on the pipe input becomes
+        the camera clock for the whole composite.
+        """
+        cap = None
         try:
             import cv2
             cap = cv2.VideoCapture(self.camera_idx, cv2.CAP_AVFOUNDATION)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-            ok = False
-            for _ in range(10):
-                if cap.isOpened() and cap.read()[0]:
-                    ok = True
-                    break
-                time.sleep(0.1)
-            cap.release()
-            return ok
+            if not cap.isOpened():
+                return None
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            return estimate_fps(lambda: cap.read()[0], window=0.7)
         except Exception:
-            return False
+            return None
+        finally:
+            if cap is not None:
+                cap.release()
 
     def stop_recording(self):
+        """Stop ffmpeg with SIGTERM.
+
+        The interactive 'q' command is ignored while a pipe input is open
+        (measured: ffmpeg kept encoding for 11s after 'q'), and writing the str
+        "q" to a binary pipe raised TypeError anyway. SIGTERM makes ffmpeg flush
+        the muxer and exit with 255, which recording_succeeded() accepts.
+        """
         if self.proc and self.proc.poll() is None:
             self.status_label.setText("Stopping…")
-            try:
-                self.proc.stdin.write("q")
-                self.proc.stdin.flush()
-            except Exception:
-                self.proc.terminate()
+            self._stop_requested = True
+            self.proc.terminate()
         # wait for ffmpeg to finalize the file
         QTimer.singleShot(300, self._finalize)
 
     def _finalize(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        proc = self.proc
+        if proc and proc.poll() is None:
+            # stop_recording() already signalled ffmpeg. Signalling again while
+            # it is flushing the muxer costs the moov atom and the file will not
+            # play, so only escalate when it ignores us.
+            if not self._stop_requested:
+                proc.terminate()
             try:
-                self.proc.wait(timeout=5)
+                proc.wait(timeout=10)
             except Exception:
-                self.proc.kill()
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        self._stop_requested = False
         self.elapsed_timer.stop()
         if getattr(self, "cam_feed", None):
             self.cam_feed.stop()
@@ -932,6 +1055,7 @@ class ScreenRecorderMac(QMainWindow):
             self.cam_feed = None
         if self.live_thread:
             self.live_thread.stop()
+            self.live_thread.wait(3000)
             self.live_thread = None
         if self.live_window:
             self.live_window.close()
@@ -946,9 +1070,12 @@ class ScreenRecorderMac(QMainWindow):
 
         err_tail = ""
         if self.proc and self.proc.stderr:
-            err_tail = self.proc.stderr.read()[-800:]
+            try:
+                err_tail = self.proc.stderr.read()[-800:]
+            except Exception:
+                err_tail = ""
         code = self.proc.returncode if self.proc else -1
-        if code not in (0, 255) or not os.path.exists(self.output_path):
+        if not recording_succeeded(code, self.output_path):
             QMessageBox.critical(
                 self, "PyRecorder",
                 "Recording failed.\n\nIf the video is black or empty, grant "
