@@ -110,14 +110,15 @@ def probe_audio_device(mic_idx, ffmpeg=None, timeout=10):
     return proc.returncode == 0
 
 
-def frames_due(next_due, now, interval, max_catchup=0.5):
+def frames_due(next_due, now, interval, max_catchup=2.0):
     """(copies_to_write, new_next_due) for a writer pacing to `interval`.
 
     The camera pipe carries no timestamps — ffmpeg derives them from the
     declared framerate — so the writer must honour that rate exactly or the
-    camera-only file ends up shorter than the composite. Duplicates the last
-    frame when the device is slow, drops frames when it is fast, and resyncs
-    with a single frame instead of bursting after a stall.
+    camera timeline drifts behind the screen timeline and, because `overlay`
+    waits for both inputs, the recording ends up shorter than the session.
+    Falling behind is therefore paid back by duplicating frames; only a stall
+    longer than `max_catchup` resyncs, to avoid flooding the pipe.
     """
     if now < next_due:
         return 0, next_due
@@ -128,6 +129,25 @@ def frames_due(next_due, now, interval, max_catchup=0.5):
     return n, next_due + n * interval
 
 
+def pipe_camera_size(native, layout, separate, pip_w):
+    """The frame size to push through the camera pipe.
+
+    Raw BGR at 1920x1080 is 6.2MB per frame (~112MB/s at 18fps), which a Python
+    feeder cannot sustain while the GUI and the preview reader contend for the
+    GIL: measured 13.2 delivered fps against 18.7 declared, and a 6s session
+    came out 1.67s long. So only send full resolution when something needs it —
+    the separate camera file, or a speaker layout compositing at 1080 high.
+    """
+    w, h = int(native[0]), int(native[1])
+    if separate or layout != "pip":
+        return (w, h)
+    target_w = int(pip_w) & ~1              # even, matches scale=W:-2
+    if target_w < 2 or target_w >= w:
+        return (w, h)
+    target_h = max(2, int(round(h * target_w / w)) & ~1)
+    return (target_w, target_h)
+
+
 PREVIEW_W, PREVIEW_H = 640, 360
 # this device (and most modern cams) only delivers 1080p; request that and
 # scale down in the filter — forcing smaller sizes fails with I/O error
@@ -135,6 +155,128 @@ CAMERA_CAPTURE_SIZE = "1920x1080"
 # The live-preview stream is letterboxed onto this fixed canvas so the reader
 # never has to guess the geometry (it used to, and got Speaker modes wrong).
 LIVE_PREVIEW_W, LIVE_PREVIEW_H = 480, 270
+
+GO_STYLE = ("QPushButton { background-color: #4CAF50; color: white;"
+            " font-size: 14px; font-weight: bold; border-radius: 6px; }"
+            " QPushButton:hover { background-color: #45a049; }")
+STOP_STYLE = ("QPushButton { background-color: #f44336; color: white;"
+              " font-size: 14px; font-weight: bold; border-radius: 6px; }"
+              " QPushButton:hover { background-color: #da190b; }")
+
+
+def _open_camera(idx):
+    """Open `idx` through OpenCV's AVFoundation backend and ask for 1080p.
+
+    The device decides what it actually delivers, so callers must read the real
+    frame size instead of assuming the request was honoured.
+    """
+    import cv2
+    cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    return cap
+
+
+def probe_camera(camera_idx, window=0.7):
+    """Measure a camera: {"fps": float|None, "size": (w, h)} or None if unusable.
+
+    Both facts are needed because the recorder feeds ffmpeg through a rawvideo
+    pipe, which carries neither timestamps nor format probing: the declared rate
+    becomes the camera clock, and the declared geometry decides whether a 4:3
+    camera gets stretched into 16:9. Blocks for ~`window` seconds, so call it
+    from a worker thread.
+    """
+    cap = None
+    try:
+        cap = _open_camera(camera_idx)
+        if cap is None or not cap.isOpened():
+            return None
+        seen = []
+
+        def read():
+            ok, frame = cap.read()
+            if ok and not seen:
+                seen.append((int(frame.shape[1]), int(frame.shape[0])))
+            return ok
+
+        fps = estimate_fps(read, window=window)
+        if not seen:
+            return None
+        return {"fps": fps, "size": seen[0]}
+    except Exception:
+        return None
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+
+def letterbox(frame, w, h):
+    """Resize `frame` into exactly (w, h) without distorting it.
+
+    Used for the preview bubble, whose window is locked to 16:9 while the camera
+    may not be — resizing to fill used to squeeze 4:3 into 16:9.
+    """
+    import cv2
+    import numpy as np
+    fh, fw = frame.shape[:2]
+    s = min(w / fw, h / fh)
+    nw, nh = max(1, int(round(fw * s))), max(1, int(round(fh * s)))
+    small = cv2.resize(frame, (nw, nh))
+    out = np.zeros((h, w, 3), np.uint8)
+    y0, x0 = (h - nh) // 2, (w - nw) // 2
+    out[y0:y0 + nh, x0:x0 + nw] = small[:, :, :3] if small.ndim == 3 else small
+    return out
+
+
+def clamp_pip(pip, cap_w, cap_h, aspect=9 / 16):
+    """(w, x, y) kept fully inside the capture area.
+
+    `aspect` is the camera's height/width, so a 4:3 camera (taller than the
+    16:9 the bubble window shows) still lands entirely inside the frame.
+    """
+    w, x, y = pip
+    h = int(w * aspect)
+    x = max(0, min(x, cap_w - w))
+    y = max(0, min(y, cap_h - h))
+    return w, x, y
+
+
+class PreRecordProbe(QThread):
+    """Run the blocking device probes off the GUI thread.
+
+    start_recording() used to do them inline: ~0.7–1s for the camera plus ~0.4s
+    for the microphone froze the window on every Start.
+    """
+    done = pyqtSignal(dict)
+
+    def __init__(self, camera_idx, mic_idx, want_camera, want_mic,
+                 camera_prober=probe_camera, mic_prober=probe_audio_device):
+        super().__init__()
+        self.camera_idx = camera_idx
+        self.mic_idx = mic_idx
+        self.want_camera = want_camera
+        self.want_mic = want_mic
+        self._camera_prober = camera_prober
+        self._mic_prober = mic_prober
+
+    def run(self):
+        camera = None
+        if self.want_camera and self.camera_idx is not None:
+            try:
+                camera = self._camera_prober(self.camera_idx)
+            except Exception:
+                camera = None
+        mic_ok = False
+        if self.want_mic and self.mic_idx is not None:
+            try:
+                mic_ok = bool(self._mic_prober(self.mic_idx))
+            except Exception:
+                mic_ok = False
+        self.done.emit({"camera": camera, "mic_ok": mic_ok})
 
 
 class CameraFrameThread(QThread):
@@ -153,18 +295,12 @@ class CameraFrameThread(QThread):
         self._stop = False
 
     def _open(self):
-        import cv2
-        cap = cv2.VideoCapture(self.camera_idx, cv2.CAP_AVFOUNDATION)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        return cap
+        return _open_camera(self.camera_idx)
 
     def stop(self):
         self._stop = True
 
     def run(self):
-        import cv2
         import time
         attempt = 0
         while not self._stop:
@@ -192,7 +328,7 @@ class CameraFrameThread(QThread):
                     time.sleep(0.1)
                     continue
                 bad = 0
-                small = cv2.resize(frame, (PREVIEW_W, PREVIEW_H))
+                small = letterbox(frame, PREVIEW_W, PREVIEW_H)
                 img = QImage(small.tobytes(), PREVIEW_W, PREVIEW_H,
                              PREVIEW_W * 3,
                              QImage.Format.Format_BGR888).copy()
@@ -352,7 +488,7 @@ class PipPreviewWindow(QWidget):
 def build_command(output_path, fps, screen_idx, mic_idx, camera_idx,
                   mic_enabled, camera_enabled, pip, region=None,
                   screen_scale=1.0, layout="pip", separate=False, preview=False,
-                  camera_pipe_fd=None, camera_fps=None):
+                  camera_pipe_fd=None, camera_fps=None, camera_size=None):
     """Assemble the ffmpeg command.
 
     region: (x, y, w, h) logical points, or None for full screen.
@@ -405,9 +541,13 @@ def build_command(output_path, fps, screen_idx, mic_idx, camera_idx,
 
     cam_stream = None
     if camera_enabled and camera_idx is not None and camera_pipe_fd is not None:
+        if camera_size:
+            size_str = f"{int(camera_size[0])}x{int(camera_size[1])}"
+        else:
+            size_str = CAMERA_CAPTURE_SIZE
         cmd += [
             "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-video_size", CAMERA_CAPTURE_SIZE,
+            "-video_size", size_str,
             "-framerate", str(round(camera_fps or fps, 3)),
             "-i", f"pipe:{camera_pipe_fd}",
         ]
@@ -478,11 +618,14 @@ class CameraPipeFeed(QThread):
     that ffmpeg reads as its second input. Closing the pipe signals EOF."""
     failed = pyqtSignal(str)
 
-    def __init__(self, camera_idx, write_fd, fps):
+    def __init__(self, camera_idx, write_fd, fps, size=None, opener=None):
         super().__init__()
         self.camera_idx = camera_idx
         self.write_fd = write_fd
         self.fps = fps
+        # geometry the pipe promised ffmpeg; frames are resized to match it
+        self.size = tuple(size) if size else (1920, 1080)
+        self._opener = opener or _open_camera
         self._stop = False
 
     def stop(self):
@@ -491,14 +634,11 @@ class CameraPipeFeed(QThread):
     def run(self):
         import cv2
         try:
-            cap = cv2.VideoCapture(self.camera_idx, cv2.CAP_AVFOUNDATION)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-            if not cap.isOpened():
+            cap = self._opener(self.camera_idx)
+            if cap is None or not cap.isOpened():
                 self.failed.emit("Camera opened by recorder failed.")
                 return
-            target = (1920, 1080)
+            target = self.size
             # ffmpeg timestamps this pipe from the declared framerate alone, so
             # write on exactly that clock (duplicating when the device is slow).
             interval = 1.0 / (self.fps or 30)
@@ -721,6 +861,8 @@ class ScreenRecorderMac(QMainWindow):
         super().__init__()
         self.proc = None
         self._stop_requested = False
+        self._pending = None
+        self.probe_thread = None
         self.output_path = ""
         self.region = None
         self.screen_idx = self.camera_idx = self.mic_idx = None
@@ -850,11 +992,7 @@ class ScreenRecorderMac(QMainWindow):
 
         self.record_btn = QPushButton("Start Recording")
         self.record_btn.setMinimumHeight(44)
-        self.record_btn.setStyleSheet("""
-            QPushButton { background-color: #4CAF50; color: white;
-                          font-size: 14px; font-weight: bold; border-radius: 6px; }
-            QPushButton:hover { background-color: #45a049; }
-        """)
+        self.record_btn.setStyleSheet(GO_STYLE)
         self.record_btn.clicked.connect(self.toggle_recording)
         layout.addWidget(self.record_btn)
 
@@ -981,81 +1119,110 @@ class ScreenRecorderMac(QMainWindow):
 
         screen = QGuiApplication.primaryScreen()
         scale = screen.devicePixelRatio() or 1.0
-
-        cam_on = self.cam_checkbox.isChecked() and self.camera_idx is not None
-        mic_idx = self.selected_mic_index()
-        mic_on = self.mic_checkbox.isChecked() and mic_idx is not None
-        if mic_on and not probe_audio_device(mic_idx):
-            QMessageBox.warning(
-                self, "PyRecorder",
-                "Microphone is unavailable — recording video only.\n\n"
-                "Grant access in System Settings → Privacy & Security → "
-                "Microphone, or pick another Audio input, then start again.")
-            mic_on = False
-
-        # PiP rect: prefer the preview bubble's on-screen geometry; otherwise
-        # default to bottom-right corner at the default size.
         screen_geo = screen.geometry()
-        if self.region:
-            origin_x, origin_y = screen_geo.x() + self.region[0], \
-                screen_geo.y() + self.region[1]
-        else:
-            origin_x, origin_y = screen_geo.x(), screen_geo.y()
+
+        cam_wanted = self.cam_checkbox.isChecked() and self.camera_idx is not None
+        mic_idx = self.selected_mic_index()
+        mic_wanted = self.mic_checkbox.isChecked() and mic_idx is not None
+
+        # PiP rect: prefer the preview bubble's on-screen geometry, otherwise the
+        # bottom-right corner at the default size. Clamping waits for the probe
+        # because it needs the camera's real aspect ratio.
+        cap_w = int((self.region[2] if self.region else screen_geo.width()) * scale)
+        cap_h = int((self.region[3] if self.region else screen_geo.height()) * scale)
         if self.pip_window and self.pip_window.isVisible():
-            pip = self.pip_window.pip_rect((origin_x, origin_y), scale)
-            pip_w, pip_x, pip_y = pip
-            # clamp inside the capture area
-            cap_w = int((self.region[2] if self.region
-                         else screen_geo.width()) * scale)
-            cap_h = int((self.region[3] if self.region
-                         else screen_geo.height()) * scale)
-            pip_x = max(0, min(pip_x, cap_w - pip_w))
-            pip_y = max(0, min(pip_y, cap_h - int(pip_w * 9 / 16)))
-            pip = (pip_w, pip_x, pip_y)
+            origin = (screen_geo.x() + (self.region[0] if self.region else 0),
+                      screen_geo.y() + (self.region[1] if self.region else 0))
+            pip = self.pip_window.pip_rect(origin, scale)
         else:
             margin = int(24 * scale)
             w = int(self.cam_size.value() * scale)
-            cap_w = int((self.region[2] if self.region
-                         else screen_geo.width()) * scale)
-            cap_h = int((self.region[3] if self.region
-                         else screen_geo.height()) * scale)
             pip = (w, cap_w - w - margin, cap_h - int(w * 9 / 16) - margin)
 
-        # camera must be released by the preview before recording opens it
+        # the bubble has to release the camera before the recorder opens it
+        self._close_pip_bubble()
+
+        # The device probes block for ~1s altogether (camera ~0.7s, microphone
+        # ~0.4s), so they run in a worker thread instead of freezing the window.
+        self._pending = {
+            "scale": scale, "screen_geo": screen_geo, "mic_idx": mic_idx,
+            "cam_wanted": cam_wanted, "mic_wanted": mic_wanted,
+            "pip": pip, "cap_w": cap_w, "cap_h": cap_h,
+            "fps": self.fps_spin.value(),
+            "layout": ("pip", "speaker-right", "speaker-left")[
+                self.layout_combo.currentIndex()],
+            "separate": self.separate_checkbox.isChecked(),
+        }
+        self._set_controls(False)
+        self.record_btn.setEnabled(False)
+        self.status_label.setText("Preparing devices…")
+        self.probe_thread = PreRecordProbe(
+            self.camera_idx if cam_wanted else None,
+            mic_idx if mic_wanted else None,
+            cam_wanted, mic_wanted)
+        self.probe_thread.done.connect(self._on_probes_done)
+        self.probe_thread.start()
+
+    def _close_pip_bubble(self):
         if self.pip_window:
             self.pip_window.close()
             self.pip_window = None
             self.preview_btn.setChecked(False)
             self.cam_size.setEnabled(True)
 
-        # probe the camera via OpenCV; degrade to screen-only if unavailable.
-        # The probe also measures the delivery rate the pipe must declare.
-        cam_pipe_fd = None
-        cam_fps = None
+    def _abort_start(self):
+        """Return to the idle state after a start that did not get going."""
+        self._set_controls(True)
+        self.record_btn.setEnabled(True)
+        self.record_btn.setText("Start Recording")
+        self.record_btn.setStyleSheet(GO_STYLE)
+
+    def _on_probes_done(self, result):
+        """Second half of Start: the blocking device probes have finished."""
+        p, self._pending = self._pending, None
+        cam = result.get("camera")
+        cam_on = bool(p["cam_wanted"]) and cam is not None
+        mic_on = bool(p["mic_wanted"]) and bool(result.get("mic_ok"))
+
+        if p["mic_wanted"] and not mic_on:
+            QMessageBox.warning(
+                self, "PyRecorder",
+                "Microphone is unavailable — recording video only.\n\n"
+                "Grant access in System Settings → Privacy & Security → "
+                "Microphone, or pick another Audio input, then start again.")
+        if p["cam_wanted"] and not cam_on:
+            QMessageBox.warning(
+                self, "PyRecorder",
+                "Camera is unavailable — recording screen"
+                + (" + microphone" if mic_on else "") + " only.")
+
+        cam_fps = cam_size = None
+        native = None
+        aspect = 9 / 16
         if cam_on:
-            measured = self._camera_probe()
-            if measured:
-                cam_fps = pick_camera_fps(measured, self.fps_spin.value())
-                r, w = os.pipe()
-                os.set_inheritable(r, True)
-                cam_pipe_fd = r
-                self._cam_pipe_write_fd = w
-            else:
-                QMessageBox.warning(
-                    self, "PyRecorder",
-                    "Camera is unavailable — recording screen"
-                    + (" + microphone" if mic_on else "") + " only.")
-                cam_on = False
+            # never declare more than the output rate: the composite is CFR at
+            # the GUI fps, so a higher camera clock only buys extra copies
+            cam_fps = pick_camera_fps(cam.get("fps"), p["fps"], hi=float(p["fps"]))
+            native = tuple(cam["size"])
+            aspect = native[1] / native[0]
+        pip = clamp_pip(p["pip"], p["cap_w"], p["cap_h"], aspect)
+        if cam_on:
+            cam_size = pipe_camera_size(native, p["layout"], p["separate"], pip[0])
+
+        cam_pipe_fd = None
+        if cam_on:
+            r, w = os.pipe()
+            os.set_inheritable(r, True)
+            cam_pipe_fd = r
+            self._cam_pipe_write_fd = w
 
         cmd, self.extra_files = build_command(
-            self.output_path, self.fps_spin.value(),
-            self.screen_idx, mic_idx, self.camera_idx,
+            self.output_path, p["fps"],
+            self.screen_idx, p["mic_idx"], self.camera_idx,
             mic_on, cam_on, pip,
-            region=self.region, screen_scale=scale,
-            layout=("pip", "speaker-right", "speaker-left")[
-                self.layout_combo.currentIndex()],
-            separate=self.separate_checkbox.isChecked(),
-            preview=True, camera_pipe_fd=cam_pipe_fd, camera_fps=cam_fps)
+            region=self.region, screen_scale=p["scale"], layout=p["layout"],
+            separate=p["separate"], preview=True,
+            camera_pipe_fd=cam_pipe_fd, camera_fps=cam_fps, camera_size=cam_size)
 
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -1067,6 +1234,7 @@ class ScreenRecorderMac(QMainWindow):
                 os.close(cam_pipe_fd)
                 os.close(self._cam_pipe_write_fd)
             QMessageBox.critical(self, "PyRecorder", f"Failed to start ffmpeg:\n{e}")
+            self._abort_start()
             return
 
         # the child inherited its own copy of the read end; drop ours
@@ -1080,54 +1248,24 @@ class ScreenRecorderMac(QMainWindow):
         self.cam_feed = None
         if cam_pipe_fd is not None:
             self.cam_feed = CameraPipeFeed(self.camera_idx, self._cam_pipe_write_fd,
-                                           cam_fps or self.fps_spin.value())
+                                           cam_fps or p["fps"], size=cam_size)
             self.cam_feed.failed.connect(
                 lambda m: self.status_label.setText("Camera feed: " + m))
             self.cam_feed.start()
 
         # live preview of the composited output (screen + camera)
-        pw, ph = preview_dims(self.region, screen_geo, scale)
+        pw, ph = preview_dims(self.region, p["screen_geo"], p["scale"], p["layout"])
         self.live_thread = LivePreviewThread(self.proc, pw, ph)
         self.live_window = LivePreviewWindow(pw, ph)
         self.live_thread.frame.connect(self.live_window.on_frame)
         self.live_thread.start()
         self.live_window.show()
 
+        self.record_btn.setEnabled(True)
         self.record_btn.setText("Stop Recording")
-        self.record_btn.setStyleSheet("""
-            QPushButton { background-color: #f44336; color: white;
-                          font-size: 14px; font-weight: bold; border-radius: 6px; }
-            QPushButton:hover { background-color: #da190b; }
-        """)
-        self._set_controls(False)
-        import time
+        self.record_btn.setStyleSheet(STOP_STYLE)
         self.start_time = time.time()
         self.elapsed_timer.start(500)
-
-    def _camera_probe(self):
-        """Open the camera via OpenCV, confirm it delivers frames and measure
-        the real rate. Returns the measured fps, or None when the camera is
-        unusable so the caller degrades to a screen-only recording instead of
-        failing the whole ffmpeg command.
-
-        Measuring matters: CAP_PROP_FPS lies (reported 15 for a device that
-        really delivers 24-28), and the rate declared on the pipe input becomes
-        the camera clock for the whole composite.
-        """
-        cap = None
-        try:
-            import cv2
-            cap = cv2.VideoCapture(self.camera_idx, cv2.CAP_AVFOUNDATION)
-            if not cap.isOpened():
-                return None
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-            return estimate_fps(lambda: cap.read()[0], window=0.7)
-        except Exception:
-            return None
-        finally:
-            if cap is not None:
-                cap.release()
 
     def stop_recording(self):
         """Stop ffmpeg with SIGTERM.
@@ -1174,11 +1312,8 @@ class ScreenRecorderMac(QMainWindow):
             self.live_window.close()
             self.live_window = None
         self.record_btn.setText("Start Recording")
-        self.record_btn.setStyleSheet("""
-            QPushButton { background-color: #4CAF50; color: white;
-                          font-size: 14px; font-weight: bold; border-radius: 6px; }
-            QPushButton:hover { background-color: #45a049; }
-        """)
+        self.record_btn.setStyleSheet(GO_STYLE)
+        self.record_btn.setEnabled(True)
         self._set_controls(True)
 
         err_tail = ""
