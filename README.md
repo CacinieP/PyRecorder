@@ -218,7 +218,7 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 
 ### 仓库层面
 
-13. ⚠️ **CI 仍不构成质量门禁**：`.github/workflows/ci.yml` 的安装、测试、flake8 三步全部以 `|| true` 结尾。本分支已补 `tests/`（32 个用例），把 `pytest` 那行的 `|| true` 去掉即可让 CI 真正生效（未改，避免影响你的分支策略）。
+13. ✅ **CI 不构成质量门禁** — 已修复：原来安装/测试/flake8 三步全部以 `|| true` 结尾，而且 CI 里根本没装 pytest。PR #1 首次运行的日志实测为 `line 1: pytest: command not found` → 回退的 `unittest discover` 输出 `Ran 0 tests in 0.000s / OK` → 恒绿、一个用例都没跑。现已显式安装 pytest、去掉三处 `|| true`，并补装 PyQt6 offscreen 运行所需的系统库（`libegl1`/`libgl1`/`libxkbcommon0` 等）与 `portaudio19-dev`（否则 pyaudio 在 ubuntu 上编译失败，整步安装会中断）。
 
 ## 本次修复涉及的文件
 
@@ -228,6 +228,7 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 | `screen_recorder_pro.py` | moviepy 2.x API；抽出 `merge_audio_video()`；流式写 wav；平台守卫 + 惰性导入；`img` 判空 |
 | `requirements.txt` | `moviepy==1.0.3` → `moviepy>=2.0`（附原因注释） |
 | `tests/` | 新增 32 个用例 |
+| `.github/workflows/ci.yml` | 显式安装 pytest 与系统库，去掉三处 `\|\| true`，让测试/lint 真正阻断 |
 
 ## 测试
 
@@ -344,7 +345,17 @@ pytest -q          # 32 passed
 
 ## CI
 
-`.github/workflows/ci.yml` 在 push / PR 到 `main`、`master` 时运行：安装依赖 → `pytest` → flake8（`E9,F63,F7,F82`）。三步均带 `|| true`，因此**CI 恒为绿灯，不能作为质量门禁**（已知问题 13）。本分支已补 `tests/`（32 个用例，`pytest -q` 全绿），去掉 `pytest` 那行的 `|| true` 即可让 CI 真正生效；注意 CI 跑在 ubuntu 上，需要能装上 `PyQt6`（用例已用 `importorskip` 兜底），而 macOS 端到端用例无法在 CI 中运行。
+`.github/workflows/ci.yml` 在 push / PR 到 `main`、`master` 时运行：装系统库（PyQt6 offscreen 运行所需 + portaudio）→ `pip install pytest` 与 `requirements.txt` → `pytest -q` → flake8（`E9,F63,F7,F82`）。测试与 lint 都是**阻断性**的（已去掉 `|| true`）。
+
+本分支之前 CI 恒绿：三步都带 `|| true`，且 runner 里没有 pytest。PR #1 首次运行的实测日志：
+
+```
+line 1: pytest: command not found
+Ran 0 tests in 0.000s
+OK
+```
+
+CI 覆盖的是纯逻辑用例（命令拼装、设备解析、帧率测量、停止路径、真实 moviepy 合并）；需要屏幕录制权限、真实摄像头与窗口系统的 macOS 端到端验证无法在 CI 中运行，详见[测试](#测试)。
 
 ## 许可证
 
