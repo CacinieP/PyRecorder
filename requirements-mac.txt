@@ -1,4 +1,4 @@
 # macOS 版依赖
-PyQt6>=6.6          # 界面
+PyQt6>=6.7,<7       # 界面（6.6.x 不锁 PyQt6-Qt6 上界，会装出 ABI 不匹配的组合）
 opencv-python>=4.8  # 摄像头采集（AVFoundation 路径，ffmpeg 的摄像头输入在某些设备上会输出冻结帧）
 # 录屏/编码由系统 ffmpeg 完成:  brew install ffmpeg

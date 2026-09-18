@@ -1,5 +1,8 @@
 # 基础版依赖
-PyQt6==6.6.1
+# PyQt6 6.6.x 的元数据只声明 PyQt6-Qt6>=6.6.0（无上界），pip 会把 Qt 6.11 装在
+# 6.6 的 wrapper 旁边，导入即崩：undefined symbol _ZN5QFont11tagToStringEj。
+# 6.7.0 起 PyQt6 会把 PyQt6-Qt6 锁到同一 minor，因此这里要求 >=6.7。
+PyQt6>=6.7,<7
 mss==9.0.1
 opencv-python==4.9.0.80
 numpy==1.26.3
@@ -7,4 +10,6 @@ Pillow==10.2.0
 
 # Pro版音频依赖
 pyaudio==0.2.14
-moviepy==1.0.3
+# moviepy 2.x: screen_recorder_pro 使用 with_audio()/subclipped()（1.x 的
+# set_audio()/subclip() 已移除），且 1.0.3 无法从顶层 moviepy 导入 VideoFileClip。
+moviepy>=2.0
