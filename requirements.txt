@@ -1,5 +1,8 @@
 # 基础版依赖
-PyQt6==6.6.1
+# PyQt6 6.6.x 的元数据只声明 PyQt6-Qt6>=6.6.0（无上界），pip 会把 Qt 6.11 装在
+# 6.6 的 wrapper 旁边，导入即崩：undefined symbol _ZN5QFont11tagToStringEj。
+# 6.7.0 起 PyQt6 会把 PyQt6-Qt6 锁到同一 minor，因此这里要求 >=6.7。
+PyQt6>=6.7,<7
 mss==9.0.1
 opencv-python==4.9.0.80
 numpy==1.26.3

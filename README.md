@@ -72,9 +72,11 @@ python screen_recorder_pro.py   :: Pro 版
 
 `start.bat` 显示的版本号为 2.0.0。Pro 版额外需要 `pyaudio`、`moviepy`；若 PyAudio 装不上可用 `pip install pipwin && pipwin install pyaudio`。
 
-> ⚠️ `requirements.txt` 钉的 `moviepy==1.0.3` 与 Pro 版代码的导入方式不兼容，**当前 Pro 版无法正常启动**，详见[已知问题与修复状态](#已知问题与修复状态)第 7 条。
+> 依赖注意事项（均已在 `requirements.txt` 中修正，历史坑见[已知问题与修复状态](#已知问题与修复状态)）：
 >
-> Pro 版依赖 `moviepy>=2.0`（`requirements.txt` 已更新）；旧的 `moviepy==1.0.3` 无法从顶层 `moviepy` 导入 `VideoFileClip`，会让 Pro 版启动即失败。
+> - **`moviepy>=2.0`**：旧的 `moviepy==1.0.3` 无法从顶层 `moviepy` 导入 `VideoFileClip`，Pro 版会启动即失败（第 8 条）
+> - **`PyQt6>=6.7,<7`**：`PyQt6==6.6.1` 不约束 `PyQt6-Qt6` 上界，全新安装会装出 ABI 不匹配的组合并直接 `ImportError`（第 14 条）
+> - **`pyaudio`** 需要系统的 portaudio；Linux/CI 上装 `portaudio19-dev`，Windows 上装不上可用 `pip install pipwin && pipwin install pyaudio`
 
 ### macOS
 
@@ -216,9 +218,15 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 12. ⚠️ **编码下拉与容器不匹配**（未改；macOS/OpenCV 5.0.0 实测，Windows 行为待核实）
     输出恒为 `.mp4`，实测 OpenCV 对 `XVID`、`MJPG` 报警告并静默回退：`tag 0x44495658/'XVID' is not supported with codec id 12 and format 'mp4'` → `fallback to use tag 'mp4v'`（`mp4v` 与 `XVID` 产物字节数完全相同可证回退），`H264` 回退 `avc1`。
 
-### 仓库层面
+### 依赖与仓库层面
 
 13. ✅ **CI 不构成质量门禁** — 已修复：原来安装/测试/flake8 三步全部以 `|| true` 结尾，而且 CI 里根本没装 pytest。PR #1 首次运行的日志实测为 `line 1: pytest: command not found` → 回退的 `unittest discover` 输出 `Ran 0 tests in 0.000s / OK` → 恒绿、一个用例都没跑。现已显式安装 pytest、去掉三处 `|| true`，并补装 PyQt6 offscreen 运行所需的系统库（`libegl1`/`libgl1`/`libxkbcommon0` 等）与 `portaudio19-dev`（否则 pyaudio 在 ubuntu 上编译失败，整步安装会中断）。
+
+14. ✅ **`requirements.txt` 的 PyQt6 pin 会让全新安装直接崩**（把 CI 改成阻断后才暴露）
+    `PyQt6==6.6.1` 的元数据只声明 `PyQt6-Qt6>=6.6.0`（无上界，已查 PyPI 元数据确认），pip 于是把 **PyQt6-Qt6 6.11.2** 装在 6.6.1 的 wrapper 旁边，导入即报：
+    `ImportError: PyQt6/QtGui.abi3.so: undefined symbol: _ZN5QFont11tagToStringEj, version Qt_6`。
+    逐版本核对元数据：6.6.1 无上界，**6.7.0 起才有 `PyQt6-Qt6<6.8.0,>=6.7.0`** 这类同 minor 约束。
+    修复：`requirements.txt` 与 `requirements-mac.txt` 均改为 `PyQt6>=6.7,<7`，并新增 `tests/test_environment.py` 校验 wrapper 与 Qt 二进制的 minor 版本一致。
 
 ## 本次修复涉及的文件
 
@@ -226,20 +234,21 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 |---|---|
 | `screen_recorder_mac.py` | 每个输出加 `-r`；预览固定 480×270 letterbox；停止改为单次 SIGTERM + moov 校验；摄像头实测帧率；先 crop 后 split；关闭泄漏的管道 fd；抽出 `parse_av_devices()` / `estimate_fps()` / `pick_camera_fps()` / `recording_succeeded()` / `_mp4_has_moov()` 便于测试 |
 | `screen_recorder_pro.py` | moviepy 2.x API；抽出 `merge_audio_video()`；流式写 wav；平台守卫 + 惰性导入；`img` 判空 |
-| `requirements.txt` | `moviepy==1.0.3` → `moviepy>=2.0`（附原因注释） |
-| `tests/` | 新增 32 个用例 |
+| `requirements.txt` / `requirements-mac.txt` | `moviepy==1.0.3` → `moviepy>=2.0`；`PyQt6==6.6.1` → `PyQt6>=6.7,<7`（6.6.x 不锁 `PyQt6-Qt6` 上界，全新安装会 ImportError） |
+| `tests/` | 新增 34 个用例 |
 | `.github/workflows/ci.yml` | 显式安装 pytest 与系统库，去掉三处 `\|\| true`，让测试/lint 真正阻断 |
 
 ## 测试
 
 ```bash
 pip install PyQt6 opencv-python numpy mss pytest "moviepy>=2"
-pytest -q          # 32 passed
+pytest -q          # 34 passed
 ```
 
 - `tests/test_mac_command.py` — ffmpeg 命令拼装（每个输出都有 `-r`、预览固定尺寸、先 crop 后 split、分轨命名与码率、区域按 DPR 缩放、麦克风映射、Speaker 左右顺序）、avfoundation 设备列表解析（含真实 ffmpeg 8.1.2 输出与多屏/BlackHole 场景）、摄像头帧率测量与夹取、成功判定（含 moov 缺失的截断文件）
 - `tests/test_mac_stop.py` — 停止只发一次 SIGTERM、不写 stdin、`_finalize()` 不二次发信号
 - `tests/test_pro_recording.py` — 非 Windows 可导入、音频边录边落盘且不再缓存内存、真实 moviepy 合并出带音轨的文件、音频长于视频时被裁剪
+- `tests/test_environment.py` — PyQt6 wrapper 与 Qt 二进制的 minor 版本一致（防止 `PyQt6==6.6.1` + `PyQt6-Qt6 6.11` 这种装得上却导入即崩的组合）、两个录制模块都能导入
 
 用例只覆盖纯逻辑与可在无头环境运行的部分。需要屏幕录制权限、真实摄像头与窗口系统的端到端验证没有做成自动用例，本次改为驱动真实 GUI 类（`ScreenRecorderMac`）人工跑过：PiP+分轨、PiP+区域+分轨、Speaker Left/Right、仅屏幕，各 6 秒会话，逐个用 ffprobe 校验时长、分辨率与音轨。
 
@@ -355,7 +364,9 @@ Ran 0 tests in 0.000s
 OK
 ```
 
-CI 覆盖的是纯逻辑用例（命令拼装、设备解析、帧率测量、停止路径、真实 moviepy 合并）；需要屏幕录制权限、真实摄像头与窗口系统的 macOS 端到端验证无法在 CI 中运行，详见[测试](#测试)。
+改成阻断后第一次运行就抓到真实缺陷：`PyQt6==6.6.1` 与 pip 解析出的 `PyQt6-Qt6 6.11.2` ABI 不匹配（已知问题 14）——这类问题在 `|| true` 下永远不会暴露。
+
+CI 覆盖的是纯逻辑用例（命令拼装、设备解析、帧率测量、停止路径、真实 moviepy 合并、依赖一致性）；需要屏幕录制权限、真实摄像头与窗口系统的 macOS 端到端验证无法在 CI 中运行，详见[测试](#测试)。
 
 ## 许可证
 
