@@ -364,7 +364,16 @@ Ran 0 tests in 0.000s
 OK
 ```
 
-改成阻断后第一次运行就抓到真实缺陷：`PyQt6==6.6.1` 与 pip 解析出的 `PyQt6-Qt6 6.11.2` ABI 不匹配（已知问题 14）——这类问题在 `|| true` 下永远不会暴露。
+改成阻断后连跑三次的实测结果（ubuntu-latest / Python 3.11）：
+
+| run | 结果 | 说明 |
+|---|---|---|
+| 35316018466 | `success`（假绿） | `pytest: command not found` → `Ran 0 tests` → `OK` |
+| 35316516581 | **`failure`** | 装上了 pytest，暴露 `PyQt6 6.6.1 + PyQt6-Qt6 6.11.2` 的 ABI 崩溃（已知问题 14） |
+| 35317091089 | `success` | `30 passed, 4 skipped` —— ffmpeg 缺失，4 个 fixture 用例被跳过 |
+| 35317276962 | `success` | 补装 ffmpeg 后 **`34 passed in 1.89s`**，flake8 `--count` 输出 `0` |
+
+第一次真正阻断的运行就抓到真实缺陷：`PyQt6==6.6.1` 与 pip 解析出的 `PyQt6-Qt6 6.11.2` ABI 不匹配（已知问题 14）——这类问题在 `|| true` 下永远不会暴露。
 
 CI 覆盖的是纯逻辑用例（命令拼装、设备解析、帧率测量、停止路径、真实 moviepy 合并、依赖一致性）；需要屏幕录制权限、真实摄像头与窗口系统的 macOS 端到端验证无法在 CI 中运行，详见[测试](#测试)。
 
