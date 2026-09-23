@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
 title PyRecorder - Windows Screen Recorder
 
@@ -19,7 +20,7 @@ echo.
 python --version >nul 2>&1
 if errorlevel 1 (
     color 0C
-    echo [ERROR] Python not found. Please install Python 3.8 or higher
+    echo [ERROR] Python not found. Please install Python 3.11
     echo         Download: https://www.python.org/downloads/
     echo.
     pause
@@ -32,7 +33,7 @@ echo [OK] Python %PY_VERSION% installed
 echo.
 
 :: Check if pip is available
-pip --version >nul 2>&1
+python -m pip --version >nul 2>&1
 if errorlevel 1 (
     color 0C
     echo [ERROR] pip not available. Please reinstall Python with pip
@@ -109,29 +110,14 @@ echo.
 echo Installing dependencies, please wait...
 echo.
 
-:: Install basic dependencies
-echo [1/2] Installing basic dependencies...
-pip install PyQt6 mss opencv-python numpy Pillow --prefer-binary
+:: Use the same interpreter and dependency constraints as the application/CI.
+python -m pip install -r "%~dp0requirements.txt" --prefer-binary
 if errorlevel 1 (
     color 0C
     echo.
     echo [ERROR] Failed to install dependencies!
     goto end
 )
-echo [OK] Basic dependencies installed
-echo.
-
-:: Install Pro dependencies
-echo [2/2] Installing Pro dependencies...
-pip install pyaudio moviepy --prefer-binary
-if errorlevel 1 (
-    color 0C
-    echo.
-    echo [WARNING] Pro dependencies failed. Basic version will work.
-)
-echo [OK] Pro dependencies installed
-echo.
-
 color 0A
 echo ---------------------------------------------------------------
 echo.

@@ -4,9 +4,13 @@ Screen recording with audio, webcam overlay, and window capture support
 """
 
 import sys
+import os
+import wave
+import ctypes
+from datetime import datetime
+
 import cv2
 import numpy as np
-from mss import mss
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QFileDialog, QComboBox, QGroupBox,
@@ -14,20 +18,29 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QImage, QPixmap
-from datetime import datetime
-import threading
-import pyaudio
-import wave
-import os
-from moviepy import VideoFileClip, AudioFileClip
-import ctypes
-from ctypes import wintypes
 
-user32 = ctypes.windll.user32
+# Window capture needs the Win32 API. pyaudio / mss / moviepy are imported where
+# they are used, so this module stays importable (and its recording helpers
+# testable) on other platforms instead of dying at import time.
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+else:
+    wintypes = None
+    user32 = None
+
+
+def _require_win32():
+    if user32 is None:
+        raise RuntimeError(
+            "Window capture requires Windows (Win32 EnumWindows). "
+            "On macOS use screen_recorder_mac.py.")
 
 
 def get_visible_windows():
     """Enumerate all visible windows with titles using Win32 API"""
+    _require_win32()
     windows = []
 
     def enum_callback(hwnd, lparam):
@@ -56,21 +69,39 @@ def get_visible_windows():
 
 
 class AudioRecorder:
-    """Handle audio recording"""
+    """Record microphone audio straight to a WAV file.
+
+    Frames are written (and flushed) as they arrive. The previous version
+    appended every chunk to an in-memory list until stop(), which grew RSS by
+    ~10.6 MB/minute at 44.1 kHz / 16-bit / stereo and lost everything on a
+    crash.
+    """
 
     def __init__(self, output_path, sample_rate=44100, channels=2, chunk=1024):
         self.output_path = output_path
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk = chunk
-        self.frames = []
         self.is_recording = False
-        self.audio = pyaudio.PyAudio()
+        self.frames_written = 0
+        self.audio = None
+        self.stream = None
+        self.wf = None
+        self._fh = None
+        self._pa_continue = 0
 
     def start(self):
-        self.frames = []
-        self.is_recording = True
+        import pyaudio
+        self.frames_written = 0
         try:
+            self._pa_continue = pyaudio.paContinue
+            self.audio = pyaudio.PyAudio()
+            self._fh = open(self.output_path, 'wb')
+            self.wf = wave.open(self._fh, 'wb')
+            self.wf.setnchannels(self.channels)
+            self.wf.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
+            self.wf.setframerate(self.sample_rate)
+            self.is_recording = True
             self.stream = self.audio.open(
                 format=pyaudio.paInt16,
                 channels=self.channels,
@@ -83,30 +114,79 @@ class AudioRecorder:
         except Exception as e:
             print(f"Audio recording error: {e}")
             self.is_recording = False
+            self._close_wave()
 
     def _callback(self, in_data, frame_count, time_info, status):
-        if self.is_recording:
-            self.frames.append(in_data)
-        return (None, pyaudio.paContinue)
+        if self.is_recording and self.wf is not None:
+            try:
+                self.wf.writeframes(in_data)
+                self._fh.flush()
+                self.frames_written += frame_count
+            except Exception as e:
+                print(f"Audio write error: {e}")
+                self.is_recording = False
+        return (None, self._pa_continue)
+
+    def _close_wave(self):
+        if self.wf is not None:
+            try:
+                self.wf.close()      # patches the RIFF header with real sizes
+            except Exception:
+                pass
+            self.wf = None
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
 
     def stop(self):
         self.is_recording = False
-        if hasattr(self, 'stream'):
-            self.stream.stop_stream()
-            self.stream.close()
-        self.audio.terminate()
-        if self.frames:
+        if self.stream is not None:
             try:
-                wf = wave.open(self.output_path, 'wb')
-                wf.setnchannels(self.channels)
-                wf.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
-                wf.setframerate(self.sample_rate)
-                wf.writeframes(b''.join(self.frames))
-                wf.close()
-                return True
-            except Exception as e:
-                print(f"Error saving audio: {e}")
-        return False
+                self.stream.stop_stream()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        written = self.frames_written
+        self._close_wave()
+        if self.audio is not None:
+            try:
+                self.audio.terminate()
+            except Exception:
+                pass
+            self.audio = None
+        return written > 0 and os.path.exists(self.output_path)
+
+
+def merge_audio_video(video_path, audio_path, output_path):
+    """Merge a recorded WAV into the silent video and write `output_path`.
+
+    MoviePy 2.x renamed `set_audio()` -> `with_audio()` and
+    `subclip()` -> `subclipped()`, and `write_videofile()` no longer accepts a
+    `verbose` argument; the old calls raised on every moviepy release.
+    """
+    from moviepy import VideoFileClip, AudioFileClip
+
+    video_clip = VideoFileClip(video_path)
+    try:
+        audio_clip = AudioFileClip(audio_path)
+        try:
+            if audio_clip.duration > video_clip.duration:
+                audio_clip = audio_clip.subclipped(0, video_clip.duration)
+            final_clip = video_clip.with_audio(audio_clip)
+            final_clip.write_videofile(
+                output_path,
+                codec='libx264',
+                audio_codec='aac',
+                logger=None
+            )
+        finally:
+            audio_clip.close()
+    finally:
+        video_clip.close()
 
 
 class WebcamPreviewDialog(QDialog):
@@ -190,6 +270,7 @@ class RecordingThread(QThread):
         self.is_running = True
         self.frame_count = 0
         self.audio_recorder = None
+        self.output_saved = False
 
     def _overlay_webcam(self, frame, cam_frame, width, height):
         cam_h, cam_w = cam_frame.shape[:2]
@@ -225,130 +306,150 @@ class RecordingThread(QThread):
         self.preview_frame.emit(qimg)
 
     def run(self):
-        cap = None
+        sct = out = cap = None
+        img = None            # no frame captured yet (stopped immediately)
+        self.output_saved = False
+        temp_video_path = os.path.splitext(self.output_path)[0] + '_temp.mp4'
+        merge_path = os.path.splitext(self.output_path)[0] + '_merged.mp4'
+        audio_success = False
+        cleanup_errors = []
         try:
-            if self.record_audio and self.audio_path:
-                self.audio_recorder = AudioRecorder(self.audio_path)
-                self.audio_recorder.start()
+            try:
+                from mss import mss
 
-            sct = mss()
+                # Preserve earlier recordings, including recovery files left by
+                # a failed attempt with the same timestamp.
+                paths = [self.output_path, temp_video_path, merge_path]
+                if self.record_audio and self.audio_path:
+                    paths.append(self.audio_path)
+                for path in paths:
+                    if os.path.exists(path):
+                        raise FileExistsError(f"Recording file already exists: {path}")
 
-            # Determine capture monitor
-            if self.window_rect:
-                # Window capture mode
-                wx, wy, ww, wh = self.window_rect
-                if self.region:
-                    # Sub-region within window (relative coords)
-                    monitor = {
-                        "top": wy + self.region[1],
-                        "left": wx + self.region[0],
-                        "width": min(self.region[2], ww - self.region[0]),
-                        "height": min(self.region[3], wh - self.region[1])
-                    }
+                sct = mss()
+
+                # Determine capture monitor
+                if self.window_rect:
+                    wx, wy, ww, wh = self.window_rect
+                    if self.region:
+                        monitor = {
+                            "top": wy + self.region[1],
+                            "left": wx + self.region[0],
+                            "width": min(self.region[2], ww - self.region[0]),
+                            "height": min(self.region[3], wh - self.region[1])
+                        }
+                    else:
+                        monitor = {"top": wy, "left": wx, "width": ww, "height": wh}
+                elif self.region:
+                    monitor = {"top": self.region[1], "left": self.region[0],
+                               "width": self.region[2], "height": self.region[3]}
                 else:
-                    monitor = {"top": wy, "left": wx, "width": ww, "height": wh}
-            elif self.region:
-                monitor = {"top": self.region[1], "left": self.region[0],
-                          "width": self.region[2], "height": self.region[3]}
-            else:
-                monitor = sct.monitors[1]
+                    monitor = sct.monitors[1]
 
-            width = monitor["width"]
-            height = monitor["height"]
+                width = monitor["width"]
+                height = monitor["height"]
+                if width <= 0 or height <= 0:
+                    raise ValueError("Invalid capture area (zero size)")
 
-            if width <= 0 or height <= 0:
-                self.error.emit("Invalid capture area (zero size)")
-                self.finished.emit()
-                return
+                fourcc = cv2.VideoWriter_fourcc(*self.codec)
+                out = cv2.VideoWriter(temp_video_path, fourcc, self.fps, (width, height))
+                if not out.isOpened():
+                    raise RuntimeError(
+                        f"Cannot open video writer for codec {self.codec}. "
+                        "Check the output folder and try mp4v.")
 
-            fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            temp_video_path = self.output_path.replace('.mp4', '_temp.mp4')
-            out = cv2.VideoWriter(temp_video_path, fourcc, self.fps, (width, height))
+                if self.record_audio and self.audio_path:
+                    self.audio_recorder = AudioRecorder(self.audio_path)
+                    self.audio_recorder.start()
 
-            if self.webcam_enabled:
-                cap = cv2.VideoCapture(0)
-                if not cap.isOpened():
-                    cap = None
+                if self.webcam_enabled:
+                    cap = cv2.VideoCapture(0)
 
-            self.frame_count = 0
-            last_time = datetime.now()
-            preview_interval = max(1, self.fps // 5)
+                self.frame_count = 0
+                last_time = datetime.now()
+                preview_interval = max(1, self.fps // 5)
 
-            while self.is_running:
-                screenshot = sct.grab(monitor)
-                img = np.array(screenshot)
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                while self.is_running:
+                    screenshot = sct.grab(monitor)
+                    # MSS supplies BGRA; OpenCV VideoWriter expects BGR.
+                    img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_BGRA2BGR)
 
-                if cap is not None and cap.isOpened():
-                    ret, cam_frame = cap.read()
-                    if ret:
-                        cam_h, cam_w = cam_frame.shape[:2]
-                        target_w = self.webcam_size
-                        target_h = int(target_w * cam_h / cam_w)
-                        cam_frame = cv2.resize(cam_frame, (target_w, target_h))
-                        self._overlay_webcam(img, cam_frame, width, height)
+                    if cap is not None and cap.isOpened():
+                        ret, cam_frame = cap.read()
+                        if ret:
+                            cam_h, cam_w = cam_frame.shape[:2]
+                            target_w = self.webcam_size
+                            target_h = int(target_w * cam_h / cam_w)
+                            cam_frame = cv2.resize(cam_frame, (target_w, target_h))
+                            self._overlay_webcam(img, cam_frame, width, height)
 
-                out.write(img)
-                self.frame_count += 1
+                    out.write(img)
+                    self.frame_count += 1
 
-                current_time = datetime.now()
-                if (current_time - last_time).seconds >= 1:
-                    self.progress.emit(self.frame_count)
-                    last_time = current_time
+                    current_time = datetime.now()
+                    if (current_time - last_time).seconds >= 1:
+                        self.progress.emit(self.frame_count)
+                        last_time = current_time
 
-                if self.frame_count % preview_interval == 0:
-                    self._emit_preview(img, width, height)
+                    if self.frame_count % preview_interval == 0:
+                        self._emit_preview(img, width, height)
 
-                cv2.waitKey(int(1000 / self.fps))
+                    cv2.waitKey(int(1000 / self.fps))
+            finally:
+                # Release every device even when another resource fails to close.
+                for resource, method in ((out, 'release'), (cap, 'release'),
+                                         (sct, 'close')):
+                    if resource is not None:
+                        try:
+                            getattr(resource, method)()
+                        except Exception as exc:
+                            cleanup_errors.append(str(exc))
+                if self.audio_recorder is not None:
+                    try:
+                        audio_success = self.audio_recorder.stop()
+                    except Exception as exc:
+                        cleanup_errors.append(str(exc))
 
-            out.release()
-            if cap is not None:
-                cap.release()
+            if cleanup_errors:
+                raise RuntimeError("Could not finalize recording: " + '; '.join(cleanup_errors))
+            if self.frame_count == 0:
+                raise RuntimeError("Recording stopped before any video frames were captured.")
+            if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
+                raise RuntimeError("The video writer produced no output.")
 
             # Final preview
-            self._emit_preview(img, width, height)
+            if img is not None:
+                self._emit_preview(img, width, height)
             self.progress.emit(self.frame_count)
 
-            audio_success = False
-            if self.audio_recorder:
-                audio_success = self.audio_recorder.stop()
-
-            if self.record_audio and audio_success and os.path.exists(self.audio_path):
-                try:
-                    video_clip = VideoFileClip(temp_video_path)
-                    audio_clip = AudioFileClip(self.audio_path)
-
-                    video_duration = video_clip.duration
-                    if audio_clip.duration > video_duration:
-                        audio_clip = audio_clip.subclip(0, video_duration)
-
-                    final_clip = video_clip.set_audio(audio_clip)
-                    final_clip.write_videofile(
-                        self.output_path,
-                        codec='libx264',
-                        audio_codec='aac',
-                        verbose=False,
-                        logger=None
-                    )
-
-                    video_clip.close()
-                    audio_clip.close()
-                    os.remove(temp_video_path)
-                    os.remove(self.audio_path)
-                except Exception as e:
-                    self.error.emit(f"Failed to merge audio/video: {e}")
-                    if os.path.exists(temp_video_path):
-                        os.rename(temp_video_path, self.output_path)
+            if self.record_audio:
+                if not (audio_success and self.audio_path and
+                        os.path.exists(self.audio_path) and os.path.getsize(self.audio_path) > 0):
+                    raise RuntimeError(
+                        "Microphone audio was not recorded. The captured video has been kept "
+                        "for recovery; check the microphone or disable audio and try again.")
+                # Publish only a completed merge. A failed encode may leave a
+                # partial file; keep it separate from the final output and retain
+                # the original video/audio so they can be recovered.
+                merge_audio_video(temp_video_path, self.audio_path, merge_path)
+                if not os.path.exists(merge_path) or os.path.getsize(merge_path) == 0:
+                    raise RuntimeError("Audio/video merge produced no output.")
+                os.rename(merge_path, self.output_path)
+                self.output_saved = True
+                for path in (temp_video_path, self.audio_path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass  # A leftover recovery file does not invalidate the output.
             else:
-                if os.path.exists(temp_video_path):
-                    os.rename(temp_video_path, self.output_path)
-
+                os.rename(temp_video_path, self.output_path)
+                self.output_saved = True
         except Exception as e:
-            if cap is not None:
-                cap.release()
-            self.error.emit(f"Recording error: {e}")
-
-        self.finished.emit()
+            self.error.emit(
+                f"Recording error: {e}\nAny captured video/audio has been kept in:\n"
+                f"{os.path.dirname(os.path.abspath(self.output_path))}")
+        finally:
+            self.finished.emit()
 
     def stop(self):
         self.is_running = False
@@ -669,6 +770,7 @@ class ScreenRecorderPro(QMainWindow):
             self.window_combo.addItem("(No windows found)", None)
 
     def _get_selected_window_rect(self):
+        _require_win32()
         hwnd = self.window_combo.currentData()
         if hwnd is None:
             return None
@@ -699,7 +801,6 @@ class ScreenRecorderPro(QMainWindow):
         selector.showFullScreen()
 
     def on_region_selected(self, region):
-        mode = self.capture_mode_combo.currentText()
         self.region = region
         self.region_label.setText(f"Region: {region[2]}x{region[3]}")
 
@@ -824,6 +925,14 @@ class ScreenRecorderPro(QMainWindow):
             QPushButton:hover { background-color: #45a049; }
         """)
         self._set_controls_enabled(True)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+
+        if not self.recording_thread or not self.recording_thread.output_saved:
+            self.status_label.setText("Recording failed. See the error for details.")
+            self.preview_label.setText("Recording was not saved.\nYou can start a new recording.")
+            self.start_time = None
+            return
 
         if self.start_time:
             elapsed = (datetime.now() - self.start_time).total_seconds()
@@ -837,6 +946,7 @@ class ScreenRecorderPro(QMainWindow):
             )
 
         self.preview_label.setText("Recording saved.\nStart a new recording to preview.")
+        self.start_time = None
 
     def recording_error(self, error_msg):
         QMessageBox.critical(self, "PyRecorder - Error", f"Recording error:\n{error_msg}")
