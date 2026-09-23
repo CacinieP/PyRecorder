@@ -14,6 +14,8 @@ import sys
 import time
 from datetime import datetime
 
+from process_output import ProcessOutputReader
+
 from PyQt6.QtCore import QEvent, QRect, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
@@ -265,18 +267,19 @@ class PreRecordProbe(QThread):
 
     def run(self):
         camera = None
-        if self.want_camera and self.camera_idx is not None:
+        if not self.isInterruptionRequested() and self.want_camera and self.camera_idx is not None:
             try:
                 camera = self._camera_prober(self.camera_idx)
             except Exception:
                 camera = None
         mic_ok = False
-        if self.want_mic and self.mic_idx is not None:
+        if not self.isInterruptionRequested() and self.want_mic and self.mic_idx is not None:
             try:
                 mic_ok = bool(self._mic_prober(self.mic_idx))
             except Exception:
                 mic_ok = False
-        self.done.emit({"camera": camera, "mic_ok": mic_ok})
+        if not self.isInterruptionRequested():
+            self.done.emit({"camera": camera, "mic_ok": mic_ok})
 
 
 class CameraFrameThread(QThread):
@@ -395,6 +398,8 @@ class PipPreviewWindow(QWidget):
         self.thread = CameraFrameThread(camera_idx)
         self.thread.frame.connect(self.on_frame)
         self.thread.failed.connect(self.on_failed)
+        self.thread.finished.connect(self._finish_close)
+        self._closing = False
         self.thread.start()
 
     def _reposition_overlays(self, grip=None):
@@ -472,9 +477,16 @@ class PipPreviewWindow(QWidget):
         self.geometry_changed.emit()
 
     def closeEvent(self, event):
+        self._closing = True
         self.thread.stop()
-        self.thread.wait(3000)
+        if self.thread.isRunning():
+            event.ignore()
+            return
         super().closeEvent(event)
+
+    def _finish_close(self):
+        if self._closing:
+            self.close()
 
     def pip_rect(self, capture_origin_logical, scale):
         """(w, x, y) in device pixels relative to the capture origin."""
@@ -633,6 +645,7 @@ class CameraPipeFeed(QThread):
 
     def run(self):
         import cv2
+        cap = None
         try:
             cap = self._opener(self.camera_idx)
             if cap is None or not cap.isOpened():
@@ -658,11 +671,22 @@ class CameraPipeFeed(QThread):
                 payload = last.tobytes()
                 for _ in range(due):
                     try:
-                        os.write(self.write_fd, payload)
+                        remaining = memoryview(payload)
+                        while remaining and not self._stop:
+                            written = os.write(self.write_fd, remaining)
+                            if written <= 0:
+                                return
+                            remaining = remaining[written:]
                     except OSError:
                         return  # reader gone — recording stopped
-            cap.release()
+        except Exception as exc:
+            self.failed.emit(str(exc))
         finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
             try:
                 os.close(self.write_fd)  # EOF for ffmpeg
             except OSError:
@@ -861,8 +885,15 @@ class ScreenRecorderMac(QMainWindow):
         super().__init__()
         self.proc = None
         self._stop_requested = False
+        self._stop_started = None
+        self._kill_requested = False
+        self._session = 0
+        self._state = "idle"
+        self._closing = False
         self._pending = None
         self.probe_thread = None
+        self.stderr_reader = None
+        self._retired_pip_windows = []
         self.output_path = ""
         self.region = None
         self.screen_idx = self.camera_idx = self.mic_idx = None
@@ -873,6 +904,9 @@ class ScreenRecorderMac(QMainWindow):
         self.extra_files = []
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.timeout.connect(self.update_elapsed)
+        self.lifecycle_timer = QTimer(self)
+        self.lifecycle_timer.setInterval(50)
+        self.lifecycle_timer.timeout.connect(self._poll_lifecycle)
         self.start_time = 0.0
         self.init_ui()
         QTimer.singleShot(100, self.probe_devices)
@@ -1001,6 +1035,8 @@ class ScreenRecorderMac(QMainWindow):
     # ---- devices & permissions ----
 
     def probe_devices(self):
+        if self._closing or self._state != "idle":
+            return
         if not ffmpeg_available():
             QMessageBox.warning(
                 self, "ffmpeg not found",
@@ -1067,10 +1103,7 @@ class ScreenRecorderMac(QMainWindow):
 
     def toggle_pip_preview(self, checked):
         if not checked:
-            if self.pip_window:
-                self.pip_window.close()
-                self.pip_window = None
-            self.cam_size.setEnabled(True)
+            self._close_pip_bubble()
             return
         if self.camera_idx is None:
             self.probe_devices()
@@ -1091,12 +1124,14 @@ class ScreenRecorderMac(QMainWindow):
     # ---- recording ----
 
     def toggle_recording(self):
-        if self.proc and self.proc.poll() is None:
+        if self.proc is not None:
             self.stop_recording()
-        else:
+        elif self._state == "idle" and not self._closing:
             self.start_recording()
 
     def start_recording(self):
+        if self._closing or self._state != "idle" or self.proc is not None:
+            return
         if not ffmpeg_available():
             self.probe_devices()
             if not ffmpeg_available():
@@ -1153,32 +1188,55 @@ class ScreenRecorderMac(QMainWindow):
                 self.layout_combo.currentIndex()],
             "separate": self.separate_checkbox.isChecked(),
         }
+        self._session += 1
+        self._state = "preparing"
         self._set_controls(False)
         self.record_btn.setEnabled(False)
         self.status_label.setText("Preparing devices…")
+        self.lifecycle_timer.start()
+        self._launch_pending_probe()
+
+    def _launch_pending_probe(self):
+        if self._closing or self._pending is None or self._state != "preparing":
+            return
+        if self._retired_pip_windows:
+            return  # the preview must release the camera before probing it
+        if self.probe_thread is not None and self.probe_thread.isRunning():
+            return
+        p = self._pending
         self.probe_thread = PreRecordProbe(
-            self.camera_idx if cam_wanted else None,
-            mic_idx if mic_wanted else None,
-            cam_wanted, mic_wanted)
-        self.probe_thread.done.connect(self._on_probes_done)
+            self.camera_idx if p["cam_wanted"] else None,
+            p["mic_idx"] if p["mic_wanted"] else None,
+            p["cam_wanted"], p["mic_wanted"])
+        session = self._session
+        self.probe_thread.done.connect(lambda result: self._on_probes_done(result, session))
+        self._state = "probing"
         self.probe_thread.start()
 
     def _close_pip_bubble(self):
         if self.pip_window:
-            self.pip_window.close()
+            window = self.pip_window
             self.pip_window = None
+            window.close()
+            self._retired_pip_windows.append(window)
+            self.lifecycle_timer.start()
             self.preview_btn.setChecked(False)
-            self.cam_size.setEnabled(True)
+        self.cam_size.setEnabled(True)
 
     def _abort_start(self):
         """Return to the idle state after a start that did not get going."""
+        self._pending = None
+        self._state = "idle"
         self._set_controls(True)
         self.record_btn.setEnabled(True)
         self.record_btn.setText("Start Recording")
         self.record_btn.setStyleSheet(GO_STYLE)
 
-    def _on_probes_done(self, result):
+    def _on_probes_done(self, result, session=None):
         """Second half of Start: the blocking device probes have finished."""
+        if (self._closing or self._pending is None
+                or (session is not None and session != self._session)):
+            return
         p, self._pending = self._pending, None
         cam = result.get("camera")
         cam_on = bool(p["cam_wanted"]) and cam is not None
@@ -1195,6 +1253,8 @@ class ScreenRecorderMac(QMainWindow):
                 self, "PyRecorder",
                 "Camera is unavailable — recording screen"
                 + (" + microphone" if mic_on else "") + " only.")
+        if self._closing or (session is not None and session != self._session):
+            return  # a warning dialog may have processed a close event
 
         cam_fps = cam_size = None
         native = None
@@ -1237,6 +1297,9 @@ class ScreenRecorderMac(QMainWindow):
             self._abort_start()
             return
 
+        self.stderr_reader = ProcessOutputReader(self.proc.stderr)
+        self.stderr_reader.start()
+
         # the child inherited its own copy of the read end; drop ours
         if cam_pipe_fd is not None:
             try:
@@ -1262,89 +1325,149 @@ class ScreenRecorderMac(QMainWindow):
         self.live_window.show()
 
         self.record_btn.setEnabled(True)
+        self._state = "recording"
         self.record_btn.setText("Stop Recording")
         self.record_btn.setStyleSheet(STOP_STYLE)
         self.start_time = time.time()
         self.elapsed_timer.start(500)
 
     def stop_recording(self):
-        """Stop ffmpeg with SIGTERM.
-
-        The interactive 'q' command is ignored while a pipe input is open
-        (measured: ffmpeg kept encoding for 11s after 'q'), and writing the str
-        "q" to a binary pipe raised TypeError anyway. SIGTERM makes ffmpeg flush
-        the muxer and exit with 255, which recording_succeeded() accepts.
-        """
-        if self.proc and self.proc.poll() is None:
-            self.status_label.setText("Stopping…")
-            self._stop_requested = True
-            self.proc.terminate()
-        # wait for ffmpeg to finalize the file
-        QTimer.singleShot(300, self._finalize)
-
-    def _finalize(self):
-        proc = self.proc
-        if proc and proc.poll() is None:
-            # stop_recording() already signalled ffmpeg. Signalling again while
-            # it is flushing the muxer costs the moov atom and the file will not
-            # play, so only escalate when it ignores us.
-            if not self._stop_requested:
-                proc.terminate()
+        """Signal ffmpeg once, then let the event loop wait for its trailer."""
+        if self.proc is None or self._stop_requested:
+            return
+        self._stop_requested = True
+        self._state = "stopping"
+        self._stop_started = time.monotonic()
+        self._kill_requested = False
+        self.record_btn.setEnabled(False)
+        self.status_label.setText("Stopping…")
+        if self.proc.poll() is None:
             try:
-                proc.wait(timeout=10)
-            except Exception:
-                proc.terminate()
+                self.proc.terminate()
+            except ProcessLookupError:
+                pass  # ffmpeg exited between poll() and the signal
+        self.lifecycle_timer.start()
+
+    def _poll_lifecycle(self):
+        """Observe process/thread completion without blocking the GUI."""
+        for window in list(self._retired_pip_windows):
+            if not window.thread.isRunning():
+                window.close()
+                self._retired_pip_windows.remove(window)
+        if self._state == "preparing":
+            self._launch_pending_probe()
+        proc = self.proc
+        if proc is not None:
+            if proc.poll() is not None:
+                self._finalize(self._session)
+            elif (self._stop_requested and not self._kill_requested
+                  and time.monotonic() - self._stop_started >= 15):
+                self._kill_requested = True
                 try:
-                    proc.wait(timeout=5)
-                except Exception:
                     proc.kill()
-        self._stop_requested = False
+                except ProcessLookupError:
+                    pass
+        if self._closing:
+            self._finish_close()
+        elif (self.proc is None and self._state == "idle"
+              and not self._retired_pip_windows
+              and not (self.probe_thread and self.probe_thread.isRunning())):
+            self.lifecycle_timer.stop()
+
+    def _finalize(self, session=None):
+        """Finalize only this session, after ffmpeg and all readers have exited."""
+        if session is not None and session != self._session:
+            return
+        proc = self.proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            self.stop_recording()
+            return
+        self._state = "finalizing"
+        self.record_btn.setEnabled(False)
         self.elapsed_timer.stop()
-        if getattr(self, "cam_feed", None):
+        if self.cam_feed:
             self.cam_feed.stop()
-            self.cam_feed.wait(3000)
-            self.cam_feed = None
         if self.live_thread:
             self.live_thread.stop()
-            self.live_thread.wait(3000)
-            self.live_thread = None
+        if (any(worker and worker.isRunning() for worker in (self.cam_feed, self.live_thread))
+                or (self.stderr_reader and self.stderr_reader.is_alive())):
+            return  # retain every worker until it actually finishes
+
+        err_tail = self.stderr_reader.tail_text() if self.stderr_reader else ""
+        self.stderr_reader = None
+        self.cam_feed = None
+        self.live_thread = None
         if self.live_window:
             self.live_window.close()
             self.live_window = None
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(proc, name, None)
+            if stream:
+                try:
+                    stream.close()
+                except (AttributeError, OSError):
+                    pass
+        code = proc.returncode
+        output_path, extra_files = self.output_path, list(self.extra_files)
+        secs = time.time() - self.start_time
+        # Clear state before displaying a dialog (which runs a nested event
+        # loop). Timer callbacks must not finalize the same process twice.
+        self.proc = None
+        self._stop_requested = False
+        self._stop_started = None
+        self._state = "idle"
         self.record_btn.setText("Start Recording")
         self.record_btn.setStyleSheet(GO_STYLE)
         self.record_btn.setEnabled(True)
         self._set_controls(True)
-
-        err_tail = ""
-        if self.proc and self.proc.stderr:
-            try:
-                err_tail = self.proc.stderr.read()[-800:]
-            except Exception:
-                err_tail = ""
-        code = self.proc.returncode if self.proc else -1
-        if not recording_succeeded(code, self.output_path):
+        if not recording_succeeded(code, output_path):
+            self.status_label.setText("Failed")
             QMessageBox.critical(
                 self, "PyRecorder",
                 "Recording failed.\n\nIf the video is black or empty, grant "
                 "permissions (Screen Recording / Camera / Microphone) in "
                 "System Settings → Privacy & Security, then restart this app."
                 + (f"\n\nffmpeg output:\n{err_tail}" if err_tail else ""))
-            self.status_label.setText("Failed")
         else:
-            import time
-            secs = time.time() - self.start_time
-            files = "\n".join([self.output_path] + self.extra_files)
-            self.status_label.setText(f"Saved: {self.output_path} ({secs:.1f}s)")
-            QMessageBox.information(self, "PyRecorder",
-                                    f"Recording saved:\n{files}")
-        self.proc = None
+            files = "\n".join([output_path] + extra_files)
+            self.status_label.setText(f"Saved: {output_path} ({secs:.1f}s)")
+            if not self._closing:
+                QMessageBox.information(self, "PyRecorder", f"Recording saved:\n{files}")
 
     def update_elapsed(self):
         import time
-        if self.proc and self.proc.poll() is None:
+        if self.proc and self.proc.poll() is None and not self._stop_requested:
             self.status_label.setText(
                 f"Recording… {time.time() - self.start_time:.0f}s")
+
+    def closeEvent(self, event):
+        self._closing = True
+        self._pending = None
+        if self.probe_thread and self.probe_thread.isRunning():
+            self.probe_thread.requestInterruption()
+        self._close_pip_bubble()
+        if self.proc is not None:
+            self.stop_recording()
+        if self._shutdown_pending():
+            event.ignore()
+            self.record_btn.setEnabled(False)
+            self._set_controls(False)
+            self.status_label.setText("Closing…")
+            self.lifecycle_timer.start()
+            return
+        self.lifecycle_timer.stop()
+        self.elapsed_timer.stop()
+        event.accept()
+
+    def _shutdown_pending(self):
+        return (self.proc is not None or bool(self._retired_pip_windows)
+                or bool(self.probe_thread and self.probe_thread.isRunning()))
+
+    def _finish_close(self):
+        if not self._shutdown_pending():
+            self.close()
 
     def _set_controls(self, enabled):
         self.cam_checkbox.setEnabled(enabled)

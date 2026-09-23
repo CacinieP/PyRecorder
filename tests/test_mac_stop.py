@@ -102,10 +102,14 @@ def test_finalize_does_not_signal_ffmpeg_a_second_time(recorder, monkeypatch, tm
 
     mac.ScreenRecorderMac.stop_recording(recorder)     # user pressed Stop
     assert proc.terminate_calls == 1
-    mac.ScreenRecorderMac._finalize(recorder)          # 300ms timer fires
+    mac.ScreenRecorderMac._finalize(recorder)          # process still flushing
 
     assert proc.terminate_calls == 1, "must not re-signal a stop already requested"
     assert proc.kill_calls == 0
+    assert not spy.shown, "must return to the event loop while ffmpeg is running"
+    proc.alive = False
+    proc.returncode = 255
+    mac.ScreenRecorderMac._poll_lifecycle(recorder)
     assert spy.shown, "user must still get a dialog"
 
 
