@@ -272,10 +272,11 @@ python -m pytest -q --run-hardware -m hardware
 ```
 
 - `tests/test_mac_command.py` — ffmpeg 命令拼装（每个输出都有 `-r`、预览固定尺寸、先 crop 后 split、分轨命名与码率、区域按 DPR 缩放、麦克风映射、Speaker 左右顺序）、avfoundation 设备列表解析（含真实 ffmpeg 8.1.2 输出与多屏/BlackHole 场景）、摄像头帧率测量与夹取、成功判定（含 moov 缺失的截断文件）
-- `tests/test_mac_stop.py` — 重复停止只发一次 SIGTERM、异步收尾、窗口关闭、意外退出与过期会话回调隔离
+- `tests/test_mac_stop.py` / `tests/test_mac_lifecycle.py` — 重复停止只发一次 SIGTERM、异步收尾、窗口关闭、意外退出、过期会话回调隔离与真实 ffmpeg 合成媒体收尾
 - `tests/test_process_output.py` — 大量子进程日志不会阻塞编码器，诊断尾部内存有界且支持非 UTF-8 字节
 - `frames_due()` 节流（在 `tests/test_mac_command.py`）— 未到点不写、准点写一帧、设备慢时补帧、卡顿后重对齐而非爆发、90 帧稳定时钟不多不少
 - `tests/test_pro_recording.py` — 非 Windows 可导入、音频边录边落盘且不再缓存内存、真实 moviepy 合并出带音轨的文件、音频长于视频时被裁剪
+- `tests/test_pro_lifecycle.py` — BGRA 颜色、编码器/录音/合并失败、资源释放、保留原始文件、不误报成功，以及实际 QThread 的完成通知
 - `tests/test_mac_devices.py` — 列出全部音频/摄像头/屏幕设备（含 BlackHole 在首位的多设备场景）、麦克风探测跟随 ffmpeg 退出码与设备索引（用桩脚本，跨平台）、无效索引在真机上返回 False、音频下拉的填充/选择/重列保持/录制中禁用
 - `tests/test_mac_probes.py` — `probe_camera()` 返回实测帧率+真实分辨率（含后端损坏时返回 None）、`PreRecordProbe` 确实在非 GUI 线程跑且按需跳过、`letterbox()` 的补边位置与不变形、管道声明探测到的尺寸、feeder 按探测尺寸写入（注入假摄像头，逐字节比对未被拉伸）、落后时补帧而超长卡顿才重对齐、`pipe_camera_size()` 的四类分支
 - `tests/test_environment.py` — PyQt6 wrapper 与 Qt 二进制的 minor 版本一致（防止 `PyQt6==6.6.1` + `PyQt6-Qt6 6.11` 这种装得上却导入即崩的组合）、两个录制模块都能导入

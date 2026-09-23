@@ -247,6 +247,63 @@ def test_probe_waits_for_camera_preview_to_release_its_device(subject, monkeypat
     assert subject._state == "probing"
 
 
+def test_preview_cannot_reopen_until_previous_camera_worker_finishes(subject, monkeypatch):
+    opened = []
+
+    class Preview:
+        def __init__(self, *args):
+            self.thread = Worker()
+            opened.append(self)
+
+        def move(self, *args):
+            pass
+
+        def show(self):
+            pass
+
+        def close(self):
+            self.thread.stop()
+
+    monkeypatch.setattr(mac, "PipPreviewWindow", Preview)
+    subject.camera_idx = 0
+    subject.preview_btn.setChecked(True)
+    assert len(opened) == 1
+    subject.preview_btn.setChecked(False)
+    assert opened[0].thread.stopped
+    assert not subject.preview_btn.isEnabled()
+    subject.preview_btn.setChecked(True)  # programmatic toggle bypasses disabled UI
+    subject.toggle_pip_preview(True)      # direct calls must be guarded as well
+    subject._set_controls(True)
+    assert len(opened) == 1
+    assert not subject.preview_btn.isChecked()
+    assert not subject.preview_btn.isEnabled()
+    opened[0].thread.running = False
+    subject._poll_lifecycle()
+    assert subject.preview_btn.isEnabled()
+    subject.preview_btn.setChecked(True)
+    subject.toggle_pip_preview(True)
+    assert len(opened) == 2, "the retired camera released its device; opening is safe"
+    opened[1].thread.running = False
+    subject.preview_btn.setChecked(False)
+    subject._poll_lifecycle()
+
+
+@pytest.mark.parametrize("state,closing", [("recording", False), ("idle", True)])
+def test_retired_preview_drain_does_not_enable_preview_during_recording_or_close(
+        subject, monkeypatch, state, closing):
+    worker = Worker()
+    worker.running = False
+    subject._retired_pip_windows.append(SimpleNamespace(thread=worker, close=lambda: None))
+    subject.preview_btn.setEnabled(False)
+    subject._state, subject._closing = state, closing
+    subject._poll_lifecycle()
+    assert not subject.preview_btn.isEnabled()
+    subject.camera_idx = 0
+    monkeypatch.setattr(mac, "PipPreviewWindow", lambda *args: pytest.fail("camera opened"))
+    subject.toggle_pip_preview(True)
+    assert subject.pip_window is None
+
+
 def test_camera_feed_retries_short_writes_and_releases_capture(monkeypatch):
     pytest.importorskip("cv2")
     payload = b"abcdefghijkl"

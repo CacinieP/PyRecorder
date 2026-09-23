@@ -1105,6 +1105,11 @@ class ScreenRecorderMac(QMainWindow):
         if not checked:
             self._close_pip_bubble()
             return
+        if self._closing or self._state != "idle" or self._retired_pip_windows:
+            self.preview_btn.setChecked(False)
+            return
+        if self.pip_window is not None:
+            return
         if self.camera_idx is None:
             self.probe_devices()
             if self.camera_idx is None:
@@ -1220,6 +1225,7 @@ class ScreenRecorderMac(QMainWindow):
             window.close()
             self._retired_pip_windows.append(window)
             self.lifecycle_timer.start()
+            self.preview_btn.setEnabled(False)
             self.preview_btn.setChecked(False)
         self.cam_size.setEnabled(True)
 
@@ -1354,6 +1360,8 @@ class ScreenRecorderMac(QMainWindow):
             if not window.thread.isRunning():
                 window.close()
                 self._retired_pip_windows.remove(window)
+        if not self._retired_pip_windows and self._state == "idle" and not self._closing:
+            self.preview_btn.setEnabled(True)
         if self._state == "preparing":
             self._launch_pending_probe()
         proc = self.proc
@@ -1471,7 +1479,8 @@ class ScreenRecorderMac(QMainWindow):
 
     def _set_controls(self, enabled):
         self.cam_checkbox.setEnabled(enabled)
-        self.preview_btn.setEnabled(enabled)
+        self.preview_btn.setEnabled(enabled and self._state == "idle"
+                                    and not self._closing and not self._retired_pip_windows)
         self.layout_combo.setEnabled(enabled)
         self.separate_checkbox.setEnabled(enabled)
         self.mic_checkbox.setEnabled(enabled)
