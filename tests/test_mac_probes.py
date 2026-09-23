@@ -40,11 +40,13 @@ def _collect(thread, timeout=8.0):
 # probe_camera(): one probe, both facts ffmpeg needs for a rawvideo pipe
 # --------------------------------------------------------------------------
 
+@pytest.mark.hardware
 @pytest.mark.skipif(sys.platform != "darwin", reason="needs a real AVFoundation camera")
 def test_probe_camera_reports_none_for_an_invalid_index():
     assert mac.probe_camera(99) is None
 
 
+@pytest.mark.hardware
 @pytest.mark.skipif(sys.platform != "darwin", reason="needs a real AVFoundation camera")
 def test_probe_camera_reports_a_rate_and_the_native_frame_size():
     info = mac.probe_camera(0, window=0.4)

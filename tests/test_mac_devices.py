@@ -102,6 +102,7 @@ def test_probe_opens_exactly_the_selected_audio_device(tmp_path):
     assert "-i" in args
 
 
+@pytest.mark.hardware
 @pytest.mark.skipif(sys.platform != "darwin" or not REAL_FFMPEG,
                     reason="needs real avfoundation devices")
 def test_probe_rejects_an_invalid_device_index_on_a_real_machine():

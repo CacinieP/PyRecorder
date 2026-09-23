@@ -15,6 +15,28 @@ import pytest  # noqa: E402
 _APP = None
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-hardware", action="store_true", default=False,
+        help="run tests that access real camera and audio devices",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "hardware: requires real devices (enable with --run-hardware)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-hardware"):
+        return
+    skip_hardware = pytest.mark.skip(reason="requires --run-hardware")
+    for item in items:
+        if item.get_closest_marker("hardware"):
+            item.add_marker(skip_hardware)
+
+
 @pytest.fixture(autouse=True, scope="session")
 def qapp():
     """A QApplication for the whole session.
@@ -31,11 +53,21 @@ def qapp():
 
 
 @pytest.fixture()
-def recorder(qapp):
-    """A real ScreenRecorderMac instance (offscreen) with no recording running."""
+def recorder(qapp, monkeypatch):
+    """An offscreen recorder without automatic access to real devices."""
+    from PyQt6.QtCore import QCoreApplication, QEvent
     import screen_recorder_mac as mac
 
+    monkeypatch.setattr(mac.ScreenRecorderMac, "probe_devices", lambda self: None)
     rec = mac.ScreenRecorderMac()
     rec.proc = None
-    yield rec
-    rec.proc = None
+    try:
+        yield rec
+    finally:
+        rec.proc = None
+        rec.elapsed_timer.stop()
+        rec.close()
+        rec.deleteLater()
+        # Destroy the receiver now, before monkeypatches are undone or later
+        # tests process events and deliver its pending singleShot callbacks.
+        QCoreApplication.sendPostedEvents(rec, QEvent.Type.DeferredDelete)

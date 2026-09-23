@@ -2,7 +2,7 @@
 
 基于 PyQt6 的录屏工具，含 **Windows** 与 **macOS** 两套实现。支持全屏 / 自定义区域录制、摄像头人像画中画（PiP）、麦克风录音。
 
-> ## ✅ 状态速览（2026-09-18 实测，本分支已修复）
+> ## ✅ 状态速览（录制管线已修复）
 >
 > | 版本 | 状态 | 说明 |
 > |---|---|---|
@@ -12,6 +12,8 @@
 >
 > 实测环境：macOS 26.6.2 / Apple A18 Pro（6 核，8GB）/ ffmpeg 8.1.2 / Python 3.13.13 / PyQt6 6.11.0 / opencv 5.0.0；屏幕采集分辨率 2816×1762。
 > 修复前的缺陷与复现数据见 [已知问题与修复状态](#已知问题与修复状态)，运行方式见 [测试](#测试)。
+
+2026-09-23 迭代补齐了录制生命周期：macOS 连续点击 Stop 只请求一次停止，收尾期间界面保持响应，关闭窗口会先结束探测或录制；ffmpeg 意外退出会自动报告结果，诊断输出持续读取并只保留末尾 8 KiB。Windows Pro 修正屏幕红蓝通道、检查编码器是否成功打开，并在失败时释放录音与捕获资源、保留可恢复文件，不再误报保存成功。以上有无设备回归测试；本轮未重新进行真实屏幕、摄像头或 Windows 桌面录制验收。
 
 ## 版本与平台
 
@@ -75,7 +77,7 @@ python screen_recorder.py       :: 基础版
 python screen_recorder_pro.py   :: Pro 版
 ```
 
-`start.bat` 显示的版本号为 2.0.0。Pro 版额外需要 `pyaudio`、`moviepy`；若 PyAudio 装不上可用 `pip install pipwin && pipwin install pyaudio`。
+`start.bat` 显示的版本号为 2.0.0，安装菜单使用当前 Python 的 `python -m pip` 安装 `requirements.txt`，已有旧版 MoviePy 也会按声明升级。建议使用 Python 3.11 或 3.12。
 
 > 依赖注意事项（均已在 `requirements.txt` 中修正，历史坑见[已知问题与修复状态](#已知问题与修复状态)）：
 >
@@ -148,7 +150,7 @@ recording_YYYYMMDD_HHMMSS_screen.mp4       # macOS 勾选分轨时的纯屏幕�
 recording_YYYYMMDD_HHMMSS_camera.mp4       # macOS 勾选分轨时的纯人像（可能比主文件短 0.2–0.4s）
 ```
 
-Windows 版在合并音视频时会先写 `*_temp.mp4` 与 `*_audio.wav`，成功后删除；合并失败则把 `*_temp.mp4` 改名为最终文件（**结果是无声视频**）。
+Windows Pro 合并音视频前先写 `*_temp.mp4` 与 `*_audio.wav`，合并结果先写入 `*_merged.mp4`，成功后才发布最终文件并清理中间文件；失败时报告错误并保留可恢复的原始视频和音频。失败留下的 `*_merged.mp4` 可能不完整，不能视为已完成的成片。
 
 macOS 版体积参考（`-b:v 8M` 目标码率，2026-09-18 实测本机桌面内容）：全屏 2816×1762 约 **37–67 MB/分钟**（上限≈60 MB/分钟 = 8 Mbit/s，随画面复杂度波动），区域裁剪 1280×960 约 **25 MB/分钟**，纯人像分轨（`-b:v 2M`）约 **15–18 MB/分钟**。摄像头默认按 1920×1080 采集。
 
@@ -158,7 +160,7 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 
 **Windows**
 
-- Windows 10 / 11，Python 3.8+，≥2GB 可用内存
+- Windows 10 / 11，建议 Python 3.11 / 3.12（当前依赖不支持 Python 3.8），≥2GB 可用内存
 - 麦克风（录音，可选）、摄像头（人像，可选）
 
 **macOS**
@@ -172,7 +174,7 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 
 ## 已知问题与修复状态
 
-下列缺陷均在 2026-09-18 实测复现（环境见开头）。✅ = 本分支已修复并复测通过；⚠️ = 仍存在。
+下列历史缺陷与性能数据来自 2026-09-18 实测（环境见开头）。✅ = 已修复；⚠️ = 仍存在。2026-09-23 的生命周期改动通过自动回归验证，未重复上述真机性能测量。
 
 ### macOS 版
 
@@ -203,7 +205,7 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
    - ✅ 麦克风探测/降级：已加 `probe_audio_device()`，打不开就弹窗并降级为仅视频。实测把设备指向不存在的索引 99 → 弹出 `Microphone is unavailable — recording video only`，仍产出 5.53s 纯视频可播放文件，无错误弹窗
    - ✅ 音频设备可选：`Audio input` 下拉列出全部 avfoundation 音频设备（`parse_av_device_lists()`），录制时使用所选索引，重新探测时保留上次选择；BlackHole 因此可以在界面里选中（本次实测的是下拉能选中任意索引，未实装 BlackHole）
    - ✅ ~~探测在 GUI 线程内阻塞~~ → 见第 15 条；`probe_devices()` 的 `-list_devices` 仍在主线程（启动时约 0.2–1s）
-   - `stderr` 用 PIPE 但录制期间不读取（实测 30 秒约 1KB，短期无溢出风险）
+   - ✅ `stderr` 现由后台 reader 持续读取，仅保留末尾 8 KiB，避免长录制时日志填满管道而阻塞 ffmpeg
    - ✅ ~~非 16:9 摄像头被拉伸~~ → 见第 16 条
    - 仅支持主显示器；录制中部分控件仍可点
    - 顺手修掉的：父进程泄漏管道读端 fd、`live_thread` 只 stop 不 `wait()`、`CameraPipeFeed` 中未使用的变量
@@ -255,26 +257,30 @@ Windows 版体积参考（作者提供的经验值，未在本次实测中复核
 | `screen_recorder_mac.py` | 每个输出加 `-r`；预览固定 480×270 letterbox；停止改为单次 SIGTERM + moov 校验；摄像头实测帧率 + `frames_due()` 节流写入；先 crop 后 split；关闭泄漏的管道 fd；新增音频输入下拉与 `probe_audio_device()` 降级；抽出 `parse_av_device_lists()` / `estimate_fps()` / `pick_camera_fps()` / `frames_due()` / `probe_audio_device()` / `recording_succeeded()` / `_mp4_has_moov()` 便于测试 |
 | `screen_recorder_pro.py` | moviepy 2.x API；抽出 `merge_audio_video()`；流式写 wav；平台守卫 + 惰性导入；`img` 判空 |
 | `requirements.txt` / `requirements-mac.txt` | `moviepy==1.0.3` → `moviepy>=2.0`；`PyQt6==6.6.1` → `PyQt6>=6.7,<7`（6.6.x 不锁 `PyQt6-Qt6` 上界，全新安装会 ImportError） |
-| `tests/` | 新增 76 个用例 |
+| `tests/` | 录制命令、设备降级、停止/关闭/异常退出、资源释放与真实媒体合并回归；真实设备测试显式启用 |
 | `screen_recorder_mac.py`（第二批） | 探测移到 `PreRecordProbe` 后台线程（`start_recording()` 拆成两段）；`probe_camera()` 一次拿到帧率+分辨率；`letterbox()` 预览不变形；`pipe_camera_size()` 按需要缩小管道载荷；`frames_due()` 落后补帧；`clamp_pip()` 按真实宽高比落位；抽出 `GO_STYLE`/`STOP_STYLE` 去掉三份重复样式 |
 | `.github/workflows/ci.yml` | 显式安装 pytest 与系统库，去掉三处 `\|\| true`，让测试/lint 真正阻断 |
 
 ## 测试
 
 ```bash
-pip install PyQt6 opencv-python numpy mss pytest "moviepy>=2"
-pytest -q          # 76 passed（ubuntu CI 上会跳过 2 条需要真实 AVFoundation 设备的用例）
+python -m pip install PyQt6 opencv-python numpy mss pytest "moviepy>=2"
+python -m pytest -q     # 默认不访问摄像头/麦克风，3 条硬件用例会跳过
+
+# 仅在已授权屏幕/相机/麦克风的 macOS 真机上主动运行：
+python -m pytest -q --run-hardware -m hardware
 ```
 
 - `tests/test_mac_command.py` — ffmpeg 命令拼装（每个输出都有 `-r`、预览固定尺寸、先 crop 后 split、分轨命名与码率、区域按 DPR 缩放、麦克风映射、Speaker 左右顺序）、avfoundation 设备列表解析（含真实 ffmpeg 8.1.2 输出与多屏/BlackHole 场景）、摄像头帧率测量与夹取、成功判定（含 moov 缺失的截断文件）
-- `tests/test_mac_stop.py` — 停止只发一次 SIGTERM、不写 stdin、`_finalize()` 不二次发信号
+- `tests/test_mac_stop.py` — 重复停止只发一次 SIGTERM、异步收尾、窗口关闭、意外退出与过期会话回调隔离
+- `tests/test_process_output.py` — 大量子进程日志不会阻塞编码器，诊断尾部内存有界且支持非 UTF-8 字节
 - `frames_due()` 节流（在 `tests/test_mac_command.py`）— 未到点不写、准点写一帧、设备慢时补帧、卡顿后重对齐而非爆发、90 帧稳定时钟不多不少
 - `tests/test_pro_recording.py` — 非 Windows 可导入、音频边录边落盘且不再缓存内存、真实 moviepy 合并出带音轨的文件、音频长于视频时被裁剪
 - `tests/test_mac_devices.py` — 列出全部音频/摄像头/屏幕设备（含 BlackHole 在首位的多设备场景）、麦克风探测跟随 ffmpeg 退出码与设备索引（用桩脚本，跨平台）、无效索引在真机上返回 False、音频下拉的填充/选择/重列保持/录制中禁用
 - `tests/test_mac_probes.py` — `probe_camera()` 返回实测帧率+真实分辨率（含后端损坏时返回 None）、`PreRecordProbe` 确实在非 GUI 线程跑且按需跳过、`letterbox()` 的补边位置与不变形、管道声明探测到的尺寸、feeder 按探测尺寸写入（注入假摄像头，逐字节比对未被拉伸）、落后时补帧而超长卡顿才重对齐、`pipe_camera_size()` 的四类分支
 - `tests/test_environment.py` — PyQt6 wrapper 与 Qt 二进制的 minor 版本一致（防止 `PyQt6==6.6.1` + `PyQt6-Qt6 6.11` 这种装得上却导入即崩的组合）、两个录制模块都能导入
 
-用例只覆盖纯逻辑与可在无头环境运行的部分。需要屏幕录制权限、真实摄像头与窗口系统的端到端验证没有做成自动用例，本次改为驱动真实 GUI 类（`ScreenRecorderMac`）人工跑过：PiP+分轨、PiP+区域+分轨、Speaker Left/Right、仅屏幕，各 6 秒会话，逐个用 ffprobe 校验时长、分辨率与音轨。
+默认用例覆盖纯逻辑、模拟设备的生命周期和真实生成媒体的合并，不需要录制用户屏幕或声音。标记为 `hardware` 的 3 条用例需要 `--run-hardware`，其中一条要求相机 0 可用。完整端到端录制仍需人工验证：2026-09-18 曾人工运行 PiP+分轨、PiP+区域+分轨、Speaker Left/Right、仅屏幕，各 6 秒会话，并用 ffprobe 校验时长、分辨率与音轨。
 
 ## 性能参考
 
@@ -290,7 +296,7 @@ pytest -q          # 76 passed（ubuntu CI 上会跳过 2 条需要真实 AVFoun
 
 会话时长包含 ffmpeg 启动（约 0.3–0.7s）与收尾，成片略短属正常；分轨的 `_camera.mp4` 会比主文件短 0.2–0.4s。修复前对照：未固定输出帧率时 PiP 路径会出现 6445fps 的复制帧风暴、停止无响应、成片 0 字节。
 
-预览帧率明显低于设定 FPS 说明 GUI 侧消费不过来，ffmpeg 写预览管道会被反压，长时间录制时会拖累主输出；减负手段是不勾选分轨、缩小采集区域。摄像头一路（1920×1080 原始帧经 Python 管道）不是瓶颈——实测 feeder 稳定交付 24–28fps。
+预览帧率明显低于设定 FPS 说明 GUI 侧消费不过来，ffmpeg 写预览管道会被反压，长时间录制时会拖累主输出；减负手段是不勾选分轨、缩小采集区域。全分辨率摄像头管道也可能成为瓶颈，Corner PiP 在不保存分轨时已按实际画中画宽度缩小传输尺寸。
 
 **Windows CPU 占用**（作者提供的经验值，本次未复核）：
 
@@ -324,9 +330,9 @@ pytest -q          # 76 passed（ubuntu CI 上会跳过 2 条需要真实 AVFoun
 | 现象 | 原因 / 处理 |
 |---|---|
 | Pro 版启动报 `ImportError: cannot import name 'VideoFileClip'` | 装的是 moviepy 1.x；`pip install -U "moviepy>=2"`（已知问题 8，已修复） |
-| 录完提示 `Failed to merge audio/video` 且视频无声 | 同上；合并逻辑已改用 `with_audio()` / `subclipped()` |
+| 录完报告合并失败 | 查看弹窗中的编码错误，确认 MoviePy 2.x 与磁盘空间；原始 `*_temp.mp4` / `*_audio.wav` 会保留供恢复，`*_merged.mp4` 可能是不完整文件 |
 | PyAudio 安装失败 | `pip install pipwin && pipwin install pyaudio` |
-| 程序无法启动 | 确认 Python ≥ 3.8、依赖已装齐 |
+| 程序无法启动 | 建议使用 Python 3.11 / 3.12，并按 requirements.txt 安装依赖 |
 | 视频无声音 | 确认勾选了 `Record Audio (Microphone)` 且麦克风权限已开 |
 | 摄像头画面不显示 / 预览黑屏 | 摄像头被占用或未连接 |
 | 窗口列表为空 | 点 `Refresh`；仅列出标题非空且大于 50×50 的可见窗口 |
@@ -347,11 +353,11 @@ pytest -q          # 76 passed（ubuntu CI 上会跳过 2 条需要真实 AVFoun
 │                   录制线程 (QThread)                       │
 ├─────────────┬──────────────┬─────────────────────────────┤
 │ mss         │ OpenCV       │ PyAudio (Pro)                │
-│ 屏幕/区域   │ 摄像头采集   │ 音频 → 内存 → wav            │
+│ 屏幕/区域   │ 摄像头采集   │ 音频 → 流式写入 wav          │
 ├─────────────┴──────────────┴─────────────────────────────┤
 │      numpy 画中画叠加 + OpenCV VideoWriter 编码            │
 ├──────────────────────────────────────────────────────────┤
-│      MoviePy 音视频合并（Pro 版，当前不可用）              │
+│      MoviePy 2.x 音视频合并（Pro 版）                      │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -376,11 +382,12 @@ pytest -q          # 76 passed（ubuntu CI 上会跳过 2 条需要真实 AVFoun
 
 ## 相关文档
 
+- [开发与分支](CONTRIBUTING.md) — 分支命名、PR 合并和清理约定、本地验证与真机测试。
 - `docs/macos-research.md` — macOS 支持调研报告（调研日期 2026-09-03）：Windows 耦合点梳理、QuickTime/OBS/Kap/Cap/Screen Studio 对比、三种实现方案（mss+OpenCV / **ffmpeg+avfoundation** / 原生 ScreenCaptureKit）与落地路线。文中"~10MB/min"为方案阶段的估算，与当前代码的 `-b:v 8M`（实测 25–67MB/min，见[输出文件](#输出文件)）不符。
 
 ## CI
 
-`.github/workflows/ci.yml` 在 push / PR 到 `main`、`master` 时运行：装系统库（PyQt6 offscreen 运行所需 + portaudio）→ `pip install pytest` 与 `requirements.txt` → `pytest -q` → flake8（`E9,F63,F7,F82`）。测试与 lint 都是**阻断性**的（已去掉 `|| true`）。
+`.github/workflows/ci.yml` 在 push / PR 到 `main`、`master` 时运行 Ubuntu + Python 3.11 / 3.12 矩阵：安装系统库（PyQt6 offscreen 所需 + portaudio + ffmpeg）与 `requirements.txt` → `python -m pytest -q` → flake8（`E9,F63,F7,F82`）。测试与 lint 都是**阻断性**的，每个任务最多运行 10 分钟；CI 不启用真实硬件测试。Windows 原生捕获和 macOS 权限/设备仍需要各平台真机验收。
 
 本分支之前 CI 恒绿：三步都带 `|| true`，且 runner 里没有 pytest。PR #1 首次运行的实测日志：
 
