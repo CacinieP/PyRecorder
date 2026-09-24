@@ -1,0 +1,7 @@
+# Install alongside requirements.txt (Windows/Linux) or requirements-mac.txt.
+# mss and MoviePy are also needed by the Windows backend's device-free tests
+# when the suite runs on macOS; PyAudio is replaced by fake input devices.
+pytest>=8,<10
+flake8>=7,<8
+mss==9.0.1
+moviepy>=2.0

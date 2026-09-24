@@ -629,6 +629,8 @@ class CameraPipeFeed(QThread):
     """Capture the camera with OpenCV and write raw BGR frames into the pipe
     that ffmpeg reads as its second input. Closing the pipe signals EOF."""
     failed = pyqtSignal(str)
+    MAX_BAD_READS = 30
+    RETRY_DELAY = 0.1
 
     def __init__(self, camera_idx, write_fd, fps, size=None, opener=None):
         super().__init__()
@@ -639,9 +641,16 @@ class CameraPipeFeed(QThread):
         self.size = tuple(size) if size else (1920, 1080)
         self._opener = opener or _open_camera
         self._stop = False
+        self.failure_reason = None
 
     def stop(self):
         self._stop = True
+
+    def _fail(self, message):
+        # Keep the reason even if process completion is observed before the
+        # queued signal reaches the GUI.
+        self.failure_reason = message
+        self.failed.emit(message)
 
     def run(self):
         import cv2
@@ -649,7 +658,8 @@ class CameraPipeFeed(QThread):
         try:
             cap = self._opener(self.camera_idx)
             if cap is None or not cap.isOpened():
-                self.failed.emit("Camera opened by recorder failed.")
+                if not self._stop:
+                    self._fail("Camera opened by recorder failed.")
                 return
             target = self.size
             # ffmpeg timestamps this pipe from the declared framerate alone, so
@@ -657,12 +667,24 @@ class CameraPipeFeed(QThread):
             interval = 1.0 / (self.fps or 30)
             next_due = time.monotonic()
             last = None
+            bad_reads = 0
             while not self._stop:
                 ret, frame = cap.read()
+                if self._stop:
+                    return
                 if ret:
+                    bad_reads = 0
                     if frame.shape[1] != target[0] or frame.shape[0] != target[1]:
                         frame = cv2.resize(frame, target)
                     last = frame
+                else:
+                    bad_reads += 1
+                    if bad_reads >= self.MAX_BAD_READS:
+                        self._fail("Camera stopped delivering frames.")
+                        return
+                    # A disconnected device may fail immediately. Back off,
+                    # retaining the last frame only during this short retry.
+                    time.sleep(self.RETRY_DELAY)
                 if last is None:
                     continue
                 due, next_due = frames_due(next_due, time.monotonic(), interval)
@@ -680,7 +702,8 @@ class CameraPipeFeed(QThread):
                     except OSError:
                         return  # reader gone — recording stopped
         except Exception as exc:
-            self.failed.emit(str(exc))
+            if not self._stop:
+                self._fail(str(exc))
         finally:
             if cap is not None:
                 try:
@@ -740,26 +763,48 @@ def pick_camera_fps(measured, fallback, lo=5.0, hi=60.0):
     return float(min(hi, max(lo, measured)))
 
 
-def _mp4_has_moov(path, tail_bytes=4 * 1024 * 1024):
-    """True when the mp4 trailer (moov atom) was written.
+def _mp4_has_moov(path):
+    """Find a complete top-level moov box in a structurally complete MP4.
 
-    ffmpeg writes moov last. A recording interrupted before the muxer finished
-    leaves plenty of mdat bytes behind but no moov, so the file has a plausible
-    size yet will not play and ffprobe reports no duration.
+    A long recording's moov can itself exceed several MiB. Walk box headers
+    and skip payloads instead of searching a fixed tail window, which also
+    mistook the bytes "moov" inside media data for a completed trailer. This
+    checks container completeness; it does not decode the media streams.
     """
     try:
-        size = os.path.getsize(path)
-        if size == 0:
-            return False
         with open(path, "rb") as f:
-            f.seek(max(0, size - tail_bytes))
-            return b"moov" in f.read()
+            size = os.fstat(f.fileno()).st_size
+            offset = 0
+            found_moov = False
+            while offset < size:
+                header = f.read(8)
+                if len(header) != 8:
+                    return False
+                box_size = int.from_bytes(header[:4], "big")
+                box_type = header[4:]
+                header_size = 8
+                if box_size == 1:  # 64-bit extended size
+                    extended = f.read(8)
+                    if len(extended) != 8:
+                        return False
+                    box_size = int.from_bytes(extended, "big")
+                    header_size = 16
+                elif box_size == 0:  # this box extends to EOF
+                    box_size = size - offset
+                if box_type == b"uuid":
+                    header_size += 16  # required user-type identifier
+                if box_size < header_size or box_size > size - offset:
+                    return False
+                found_moov = found_moov or box_type == b"moov"
+                offset += box_size
+                f.seek(offset)
+            return found_moov
     except OSError:
         return False
 
 
 def recording_succeeded(returncode, output_path):
-    """A recording is good when ffmpeg exited cleanly *and* left a playable file.
+    """Require a clean ffmpeg exit and a complete MP4 container.
 
     ffmpeg exits 0 after 'q' and 255 after SIGTERM; a negative code means it was
     killed and never finalised the container. The moov check catches the case
@@ -891,6 +936,7 @@ class ScreenRecorderMac(QMainWindow):
         self._state = "idle"
         self._closing = False
         self._pending = None
+        self._recording_error = None
         self.probe_thread = None
         self.stderr_reader = None
         self._retired_pip_windows = []
@@ -1194,6 +1240,7 @@ class ScreenRecorderMac(QMainWindow):
             "separate": self.separate_checkbox.isChecked(),
         }
         self._session += 1
+        self._recording_error = None
         self._state = "preparing"
         self._set_controls(False)
         self.record_btn.setEnabled(False)
@@ -1319,7 +1366,8 @@ class ScreenRecorderMac(QMainWindow):
             self.cam_feed = CameraPipeFeed(self.camera_idx, self._cam_pipe_write_fd,
                                            cam_fps or p["fps"], size=cam_size)
             self.cam_feed.failed.connect(
-                lambda m: self.status_label.setText("Camera feed: " + m))
+                lambda message, session=self._session:
+                self._on_camera_feed_failed(message, session))
             self.cam_feed.start()
 
         # live preview of the composited output (screen + camera)
@@ -1336,6 +1384,13 @@ class ScreenRecorderMac(QMainWindow):
         self.record_btn.setStyleSheet(STOP_STYLE)
         self.start_time = time.time()
         self.elapsed_timer.start(500)
+
+    def _on_camera_feed_failed(self, message, session):
+        if session != self._session or self.proc is None:
+            return
+        self._recording_error = message
+        self.stop_recording()
+        self.status_label.setText("Camera failed — stopping…")
 
     def stop_recording(self):
         """Signal ffmpeg once, then let the event loop wait for its trailer."""
@@ -1404,6 +1459,8 @@ class ScreenRecorderMac(QMainWindow):
             return  # retain every worker until it actually finishes
 
         err_tail = self.stderr_reader.tail_text() if self.stderr_reader else ""
+        recording_error = self._recording_error or getattr(self.cam_feed, "failure_reason", None)
+        self._recording_error = None
         self.stderr_reader = None
         self.cam_feed = None
         self.live_thread = None
@@ -1430,7 +1487,20 @@ class ScreenRecorderMac(QMainWindow):
         self.record_btn.setStyleSheet(GO_STYLE)
         self.record_btn.setEnabled(True)
         self._set_controls(True)
-        if not recording_succeeded(code, output_path):
+        succeeded = recording_succeeded(code, output_path)
+        if recording_error:
+            self.status_label.setText("Stopped: camera failed")
+            message = "Recording stopped because the camera failed.\n\n" + recording_error
+            if succeeded:
+                files = "\n".join([output_path] + extra_files)
+                message += "\n\nSaved partial recording:\n" + files
+                QMessageBox.warning(self, "PyRecorder", message)
+            else:
+                message += "\n\nThe recording could not be finalized."
+                if err_tail:
+                    message += "\n\nffmpeg output:\n" + err_tail
+                QMessageBox.critical(self, "PyRecorder", message)
+        elif not succeeded:
             self.status_label.setText("Failed")
             QMessageBox.critical(
                 self, "PyRecorder",

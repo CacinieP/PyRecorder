@@ -1,6 +1,7 @@
 """Recording state transitions without opening screen, camera, or microphone."""
 import io
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -346,6 +347,117 @@ def test_camera_feed_releases_capture_when_ffmpeg_closes_pipe(monkeypatch):
     assert closed == [987654]
 
 
+@pytest.mark.parametrize("has_first_frame", [False, True])
+def test_camera_feed_stops_and_reports_persistent_read_failure(monkeypatch, has_first_frame):
+    pytest.importorskip("cv2")
+    frame = SimpleNamespace(shape=(2, 2, 3), tobytes=lambda: b"x" * 12)
+    reads, sleeps, failures, released, closed = [], [], [], [], []
+    now = [0.0]
+    monkeypatch.setattr(mac.time, "monotonic", lambda: now[0])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    def read():
+        reads.append(True)
+        # Fail rather than hang if the retry limit regresses.
+        assert len(reads) <= feed.MAX_BAD_READS + int(has_first_frame)
+        if has_first_frame and len(reads) == 1:
+            return True, frame
+        return False, None
+
+    cap = SimpleNamespace(isOpened=lambda: True, read=read,
+                          release=lambda: released.append(True))
+    feed = mac.CameraPipeFeed(0, 987654, 30, size=(2, 2), opener=lambda index: cap)
+    feed.failed.connect(failures.append)
+    monkeypatch.setattr(mac.time, "sleep", sleep)
+    monkeypatch.setattr(mac.os, "write", lambda fd, data: len(data))
+    monkeypatch.setattr(mac.os, "close", closed.append)
+    feed.run()
+
+    assert len(reads) == feed.MAX_BAD_READS + int(has_first_frame)
+    assert sleeps == [feed.RETRY_DELAY] * (feed.MAX_BAD_READS - 1)
+    assert failures == ["Camera stopped delivering frames."]
+    assert feed.failure_reason == failures[0]
+    assert released == [True] and closed == [987654]
+
+
+def test_camera_feed_recovers_after_transient_read_failures(monkeypatch):
+    pytest.importorskip("cv2")
+    frame = SimpleNamespace(shape=(2, 2, 3), tobytes=lambda: b"x" * 12)
+    results = iter([False, False, True, False, False, True])
+    failures, released, closed = [], [], []
+    now, good_reads = [0.0], [0]
+
+    def read():
+        success = next(results)
+        if success:
+            good_reads[0] += 1
+            now[0] += 1 / 30  # successful capture also advances the device clock
+        return success, frame if success else None
+
+    def write(fd, data):
+        if good_reads[0] == 2:
+            feed.stop()
+        return len(data)
+
+    cap = SimpleNamespace(isOpened=lambda: True, read=read,
+                          release=lambda: released.append(True))
+    feed = mac.CameraPipeFeed(0, 987654, 30, size=(2, 2), opener=lambda index: cap)
+    feed.MAX_BAD_READS = 3
+    feed.failed.connect(failures.append)
+    monkeypatch.setattr(mac.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(mac.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(mac.os, "write", write)
+    monkeypatch.setattr(mac.os, "close", closed.append)
+    feed.run()
+    assert good_reads[0] == 2 and failures == []
+    assert feed.failure_reason is None
+    assert released == [True] and closed == [987654]
+
+
+def test_camera_failure_stops_recording_and_reports_partial_output_once(subject):
+    proc = subject.proc = Process()
+    subject._state = "recording"
+    subject._on_camera_feed_failed("Camera disconnected", subject._session)
+    subject._on_camera_feed_failed("Camera disconnected", subject._session)
+    subject.update_elapsed()
+    assert proc.terminated == 1
+    assert subject._state == "stopping"
+    assert "Camera failed" in subject.status_label.text()
+    proc.returncode = 255
+    subject._poll_lifecycle()
+    subject._poll_lifecycle()
+    assert subject.proc is None
+    assert len(subject.dialogs) == 1
+    kind, message = subject.dialogs[0]
+    assert kind == "warning"
+    assert "Camera disconnected" in message
+    assert "partial recording" in message and subject.output_path in message
+    assert "camera failed" in subject.status_label.text()
+
+
+def test_finalize_keeps_camera_failure_even_before_queued_signal_delivery(subject):
+    subject.proc = Process(returncode=1)
+    subject.cam_feed = Worker()
+    subject.cam_feed.running = False
+    subject.cam_feed.failure_reason = "Camera stopped delivering frames."
+    subject._finalize()
+    assert subject.dialogs == [("critical", "Recording stopped because the camera failed.\n\n"
+                                "Camera stopped delivering frames.\n\n"
+                                "The recording could not be finalized.")]
+
+
+def test_old_camera_failure_cannot_stop_another_session(subject):
+    proc = subject.proc = Process()
+    subject._session = 2
+    subject._on_camera_feed_failed("Old camera failure", session=1)
+    assert proc.terminated == 0
+    assert subject._recording_error is None
+    assert subject.dialogs == []
+
+
 def _spin_until(predicate, timeout=5):
     deadline = time.monotonic() + timeout
     while not predicate() and time.monotonic() < deadline:
@@ -356,6 +468,8 @@ def _spin_until(predicate, timeout=5):
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
                     reason="requires ffmpeg and ffprobe, without capture devices")
+@pytest.mark.skipif(os.name != "posix",
+                    reason="macOS stop uses POSIX SIGTERM; Windows terminate force-kills ffmpeg")
 def test_real_ffmpeg_stop_finalizes_mp4_and_releases_all_workers(subject, monkeypatch, tmp_path):
     monkeypatch.setattr(mac, "recording_succeeded", RECORDING_SUCCEEDED)
     monkeypatch.setattr(mac, "ffmpeg_available", lambda: True)
