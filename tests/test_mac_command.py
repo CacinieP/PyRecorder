@@ -6,6 +6,7 @@ Each test names the production change that would make it fail.
 """
 import itertools
 import shutil
+import struct
 import subprocess
 
 import pytest
@@ -245,6 +246,57 @@ def test_recording_succeeded_rejects_killed_processes_and_missing_files(tmp_path
     empty = tmp_path / "empty.mp4"
     empty.write_bytes(b"")
     assert mac.recording_succeeded(255, str(empty)) is False
+
+
+def _box(kind, payload=b"", extended=False):
+    if extended:
+        return struct.pack(">I4sQ", 1, kind, 16 + len(payload)) + payload
+    return struct.pack(">I4s", 8 + len(payload), kind) + payload
+
+
+def test_mp4_trailer_detection_accepts_a_moov_larger_than_the_old_tail_window(tmp_path):
+    # Sparse payload keeps this hardware-free regression small and fast. The
+    # parser checks box boundaries; real encoded-file coverage is above.
+    path = tmp_path / "large-moov.mp4"
+    payload_size = 4 * 1024 * 1024 + 4096
+    with path.open("wb") as stream:
+        stream.write(_box(b"ftyp", b"isom\0\0\0\0isom"))
+        stream.write(_box(b"mdat", b"sample"))
+        stream.write(struct.pack(">I4s", 8 + payload_size, b"moov"))
+        stream.write(struct.pack(">I4s", payload_size, b"free"))
+        stream.seek(payload_size - 9, 1)
+        stream.write(b"\0")
+    assert mac.recording_succeeded(0, str(path))
+
+
+@pytest.mark.parametrize("data", [
+    _box(b"mdat", b"sample moov bytes"),
+    _box(b"mdat", _box(b"moov", b"nested, not a top-level trailer")),
+    struct.pack(">I4s", 0, b"mdat") + b"sample" + _box(b"moov"),
+    struct.pack(">I4s", 100, b"moov") + b"truncated",
+    struct.pack(">I4s", 4, b"moov"),
+    struct.pack(">I4s", 1, b"moov") + b"short",
+    struct.pack(">I4sQ", 1, b"moov", 12),
+    struct.pack(">I4sQ", 1, b"moov", 100) + b"truncated",
+    _box(b"moov") + b"partial",
+    _box(b"moov") + struct.pack(">I4s", 100, b"mdat") + b"short",
+    _box(b"moov") + _box(b"uuid", b"short-id"),
+])
+def test_mp4_trailer_detection_rejects_fake_trailers_and_truncated_boxes(tmp_path, data):
+    path = tmp_path / "invalid.mp4"
+    path.write_bytes(data)
+    assert not mac.recording_succeeded(255, str(path))
+
+
+@pytest.mark.parametrize("data", [
+    _box(b"ftyp", b"isom") + _box(b"mdat", b"sample") + _box(b"moov", extended=True),
+    _box(b"moov") + struct.pack(">I4s", 0, b"mdat") + b"sample",
+    _box(b"mdat", b"sample") + struct.pack(">I4s", 0, b"moov"),
+])
+def test_mp4_trailer_detection_supports_extended_sizes_and_boxes_extending_to_eof(tmp_path, data):
+    path = tmp_path / "complete.mp4"
+    path.write_bytes(data)
+    assert mac.recording_succeeded(0, str(path))
 
 
 # --------------------------------------------------------------------------

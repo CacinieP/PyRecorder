@@ -10,7 +10,7 @@ PR 说明应描述当前最终改动、验证结果和未验证的平台，追�
 
 ## 本地验证
 
-建议 Python 3.11 / 3.12。Windows 使用 `python -m pip install -r requirements.txt`；macOS 使用 `requirements-mac.txt`，并额外安装测试所需的 `mss`、`moviepy>=2`。所有平台均需 `python -m pip install pytest flake8`。真实媒体测试还需要 PATH 中有 `ffmpeg` 与 `ffprobe`。
+建议 Python 3.11 / 3.12，并在项目虚拟环境中安装依赖。Windows/Linux 使用 `python -m pip install -r requirements.txt -r requirements-test.txt`；macOS 使用 `python -m pip install -r requirements-mac.txt -r requirements-test.txt`。Windows 的 start.bat 会创建 `.venv`，可使用 `.venv\Scripts\python.exe` 执行测试。真实合成媒体测试还需要 PATH 中有 `ffmpeg` 与 `ffprobe`，CI 会强制检查，缺失即失败。
 
 ```bash
 python -m pytest -q
@@ -24,3 +24,5 @@ python -m pytest -q --run-hardware -m hardware
 ```
 
 真实屏幕捕获、平台权限、摄像头/音频同步和 Windows 窗口捕获需要人工验收。无设备测试通过不能替代这些验证。
+
+CI 包含 Ubuntu 3.11/3.12、Windows 3.12 和 macOS 3.12。POSIX SIGTERM 的 ffmpeg 收尾测试在 Windows 上明确跳过；Windows 两版通过模拟屏幕和真实编码器验证停止/关闭后的 MP4 封装。修改共享 Windows RecordingThread 时，同时检查 Basic/Pro 的 GUI 交互回归。

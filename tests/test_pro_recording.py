@@ -101,6 +101,41 @@ def test_audio_recorder_stop_returns_false_when_nothing_was_recorded(monkeypatch
     assert rec.stop() is False
 
 
+def test_audio_write_failure_after_good_samples_is_not_success(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "pyaudio", _fake_pyaudio())
+    pro = _import_pro()
+    path = tmp_path / 'partial.wav'
+    rec = pro.AudioRecorder(str(path), sample_rate=8000, channels=1)
+    rec.start()
+    stream = rec.stream
+    rec._callback(b'\x00\x00' * 8, 8, None, 0)
+
+    def fail_write(data):
+        raise OSError('disk full')
+
+    monkeypatch.setattr(rec.wf, 'writeframes', fail_write)
+    assert rec._callback(b'\x00\x00' * 8, 8, None, 0)[1] == rec._pa_abort
+    assert rec.stop() is False
+    assert 'disk full' in rec.error and stream.closed
+    with wave.open(str(path), 'rb') as source:
+        assert source.getnframes() == 8
+
+
+def test_audio_stream_error_still_closes_stream_and_preserves_failure(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "pyaudio", _fake_pyaudio())
+    pro = _import_pro()
+    rec = pro.AudioRecorder(str(tmp_path / 'audio.wav'))
+    rec.start()
+    stream = rec.stream
+
+    def failed_stop():
+        raise OSError('device disconnected')
+
+    monkeypatch.setattr(stream, 'stop_stream', failed_stop)
+    assert rec.stop() is False
+    assert stream.closed and 'device disconnected' in rec.error
+
+
 @pytest.mark.skipif(not (FFMPEG and FFPROBE), reason="needs ffmpeg/ffprobe to build fixtures")
 def test_merge_audio_video_produces_a_playable_file_with_audio(tmp_path):
     pro = _import_pro()

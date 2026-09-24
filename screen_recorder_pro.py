@@ -7,6 +7,9 @@ import sys
 import os
 import wave
 import ctypes
+import math
+import time
+import threading
 from datetime import datetime
 
 import cv2
@@ -16,7 +19,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QSpinBox, QFileDialog, QComboBox, QGroupBox,
     QMessageBox, QProgressBar, QCheckBox, QDialog, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QFont, QImage, QPixmap
 
 # Window capture needs the Win32 API. pyaudio / mss / moviepy are imported where
@@ -89,12 +92,17 @@ class AudioRecorder:
         self.wf = None
         self._fh = None
         self._pa_continue = 0
+        self._pa_abort = 2
+        self.error = None
+        self.started_at = None
 
     def start(self):
         import pyaudio
         self.frames_written = 0
+        self.error = None
         try:
             self._pa_continue = pyaudio.paContinue
+            self._pa_abort = getattr(pyaudio, 'paAbort', 2)
             self.audio = pyaudio.PyAudio()
             self._fh = open(self.output_path, 'wb')
             self.wf = wave.open(self._fh, 'wb')
@@ -108,57 +116,62 @@ class AudioRecorder:
                 rate=self.sample_rate,
                 input=True,
                 frames_per_buffer=self.chunk,
-                stream_callback=self._callback
+                stream_callback=self._callback,
+                start=False,
             )
+            self.started_at = time.monotonic()
             self.stream.start_stream()
         except Exception as e:
-            print(f"Audio recording error: {e}")
+            self.error = f"Audio recording failed: {e}"
             self.is_recording = False
-            self._close_wave()
+            self.stop()
 
     def _callback(self, in_data, frame_count, time_info, status):
+        if status:
+            self.error = self.error or f"Microphone stream interrupted (status {status})."
+            self.is_recording = False
         if self.is_recording and self.wf is not None:
             try:
                 self.wf.writeframes(in_data)
                 self._fh.flush()
                 self.frames_written += frame_count
             except Exception as e:
-                print(f"Audio write error: {e}")
+                self.error = f"Audio write failed: {e}"
                 self.is_recording = False
-        return (None, self._pa_continue)
+        return (None, self._pa_abort if self.error else self._pa_continue)
 
     def _close_wave(self):
         if self.wf is not None:
             try:
                 self.wf.close()      # patches the RIFF header with real sizes
-            except Exception:
-                pass
+            except Exception as exc:
+                self.error = self.error or f"Could not finalize audio: {exc}"
             self.wf = None
         if self._fh is not None:
             try:
                 self._fh.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.error = self.error or f"Could not close audio file: {exc}"
             self._fh = None
 
     def stop(self):
         self.is_recording = False
         if self.stream is not None:
-            try:
-                self.stream.stop_stream()
-                self.stream.close()
-            except Exception:
-                pass
+            for method in ('stop_stream', 'close'):
+                try:
+                    getattr(self.stream, method)()
+                except Exception as exc:
+                    self.error = self.error or f"Could not stop microphone: {exc}"
             self.stream = None
         written = self.frames_written
         self._close_wave()
         if self.audio is not None:
             try:
                 self.audio.terminate()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.error = self.error or f"Could not release microphone: {exc}"
             self.audio = None
-        return written > 0 and os.path.exists(self.output_path)
+        return not self.error and written > 0 and os.path.exists(self.output_path)
 
 
 def merge_audio_video(video_path, audio_path, output_path):
@@ -249,7 +262,6 @@ class RecordingThread(QThread):
     """Thread for handling screen recording"""
     progress = pyqtSignal(int)
     preview_frame = pyqtSignal(object)
-    finished = pyqtSignal()
     error = pyqtSignal(str)
 
     def __init__(self, output_path, fps, codec, region=None, record_audio=False,
@@ -271,6 +283,28 @@ class RecordingThread(QThread):
         self.frame_count = 0
         self.audio_recorder = None
         self.output_saved = False
+        self._stop_event = threading.Event()
+        self._stop_time = None
+        self.capture_duration = 0.0
+
+    def _wait_until(self, deadline):
+        """Sleep only the remaining frame interval; a stop request wakes us."""
+        self._stop_event.wait(max(0.0, deadline - time.monotonic()))
+
+    def _capture_monitor(self, default_monitor):
+        # Regions and Win32 window rectangles are both physical screen pixels.
+        if self.window_rect:
+            x, y, width, height = self.window_rect
+            if self.region:
+                rx, ry, rw, rh = self.region
+                right, bottom = min(x + width, rx + rw), min(y + height, ry + rh)
+                x, y = max(x, rx), max(y, ry)
+                width, height = right - x, bottom - y
+        elif self.region:
+            x, y, width, height = self.region
+        else:
+            return default_monitor
+        return {'left': x, 'top': y, 'width': width, 'height': height}
 
     def _overlay_webcam(self, frame, cam_frame, width, height):
         cam_h, cam_w = cam_frame.shape[:2]
@@ -328,23 +362,7 @@ class RecordingThread(QThread):
 
                 sct = mss()
 
-                # Determine capture monitor
-                if self.window_rect:
-                    wx, wy, ww, wh = self.window_rect
-                    if self.region:
-                        monitor = {
-                            "top": wy + self.region[1],
-                            "left": wx + self.region[0],
-                            "width": min(self.region[2], ww - self.region[0]),
-                            "height": min(self.region[3], wh - self.region[1])
-                        }
-                    else:
-                        monitor = {"top": wy, "left": wx, "width": ww, "height": wh}
-                elif self.region:
-                    monitor = {"top": self.region[1], "left": self.region[0],
-                               "width": self.region[2], "height": self.region[3]}
-                else:
-                    monitor = sct.monitors[1]
+                monitor = self._capture_monitor(sct.monitors[1])
 
                 width = monitor["width"]
                 height = monitor["height"]
@@ -358,18 +376,24 @@ class RecordingThread(QThread):
                         f"Cannot open video writer for codec {self.codec}. "
                         "Check the output folder and try mp4v.")
 
-                if self.record_audio and self.audio_path:
-                    self.audio_recorder = AudioRecorder(self.audio_path)
-                    self.audio_recorder.start()
-
                 if self.webcam_enabled:
                     cap = cv2.VideoCapture(0)
 
+                if self.record_audio and self.audio_path:
+                    self.audio_recorder = AudioRecorder(self.audio_path)
+                    self.audio_recorder.start()
+                    if getattr(self.audio_recorder, 'error', None):
+                        raise RuntimeError(self.audio_recorder.error)
+
                 self.frame_count = 0
-                last_time = datetime.now()
+                started = (getattr(self.audio_recorder, 'started_at', None)
+                           or time.monotonic())
+                last_time = started
                 preview_interval = max(1, self.fps // 5)
 
                 while self.is_running:
+                    if getattr(self.audio_recorder, 'error', None):
+                        raise RuntimeError(self.audio_recorder.error)
                     screenshot = sct.grab(monitor)
                     # MSS supplies BGRA; OpenCV VideoWriter expects BGR.
                     img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_BGRA2BGR)
@@ -383,18 +407,32 @@ class RecordingThread(QThread):
                             cam_frame = cv2.resize(cam_frame, (target_w, target_h))
                             self._overlay_webcam(img, cam_frame, width, height)
 
-                    out.write(img)
-                    self.frame_count += 1
-
-                    current_time = datetime.now()
-                    if (current_time - last_time).seconds >= 1:
+                    current_time = time.monotonic()
+                    end = self._stop_time if self._stop_time is not None else current_time
+                    target_frames = max(1, math.ceil(max(0.0, end - started) * self.fps - 1e-9))
+                    # CFR timestamps are implicit in VideoWriter: repeat the
+                    # latest frame when capture/encoding misses frame deadlines.
+                    while self.frame_count < target_frames:
+                        out.write(img)
+                        self.frame_count += 1
+                    if current_time - last_time >= 1:
                         self.progress.emit(self.frame_count)
                         last_time = current_time
 
                     if self.frame_count % preview_interval == 0:
                         self._emit_preview(img, width, height)
 
-                    cv2.waitKey(int(1000 / self.fps))
+                    self._wait_until(started + self.frame_count / self.fps)
+
+                ended = self._stop_time if self._stop_time is not None else time.monotonic()
+                self.capture_duration = max(0.0, ended - started)
+                # A stop can arrive during a wait; include the last partial
+                # frame interval without including resource cleanup/merge time.
+                if img is not None:
+                    target_frames = max(1, math.ceil(self.capture_duration * self.fps - 1e-9))
+                    while self.frame_count < target_frames:
+                        out.write(img)
+                        self.frame_count += 1
             finally:
                 # Release every device even when another resource fails to close.
                 for resource, method in ((out, 'release'), (cap, 'release'),
@@ -426,7 +464,8 @@ class RecordingThread(QThread):
                 if not (audio_success and self.audio_path and
                         os.path.exists(self.audio_path) and os.path.getsize(self.audio_path) > 0):
                     raise RuntimeError(
-                        "Microphone audio was not recorded. The captured video has been kept "
+                        (getattr(self.audio_recorder, 'error', None) or
+                         "Microphone audio was not recorded.") + " The captured video has been kept "
                         "for recovery; check the microphone or disable audio and try again.")
                 # Publish only a completed merge. A failed encode may leave a
                 # partial file; keep it separate from the final output and retain
@@ -448,17 +487,28 @@ class RecordingThread(QThread):
             self.error.emit(
                 f"Recording error: {e}\nAny captured video/audio has been kept in:\n"
                 f"{os.path.dirname(os.path.abspath(self.output_path))}")
-        finally:
-            self.finished.emit()
 
     def stop(self):
+        if self._stop_time is None:
+            self._stop_time = time.monotonic()
         self.is_running = False
-        self.wait()
+        self._stop_event.set()
+
+
+def physical_region(region, origin, device_pixel_ratio):
+    """Convert a local Qt selection to physical desktop pixels."""
+    x, y, width, height = region
+    left = round(x * device_pixel_ratio)
+    top = round(y * device_pixel_ratio)
+    right = round((x + width) * device_pixel_ratio)
+    bottom = round((y + height) * device_pixel_ratio)
+    return origin[0] + left, origin[1] + top, right - left, bottom - top
 
 
 class RegionSelector(QWidget):
     """Widget for selecting recording region"""
     region_selected = pyqtSignal(tuple)
+    closed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -466,6 +516,7 @@ class RegionSelector(QWidget):
                            Qt.WindowType.WindowStaysOnTopHint |
                            Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setStyleSheet("background-color: rgba(0, 120, 215, 50);")
         self.setWindowTitle("Select Region")
 
@@ -473,7 +524,7 @@ class RegionSelector(QWidget):
         self.current_pos = None
         self.selecting = False
 
-        self.setFixedSize(200, 100)
+        self.resize(200, 100)
         self.label = QLabel("Drag to select region\nPress ESC to cancel")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setStyleSheet("color: white; font-weight: bold; background: rgba(0,0,0,150); padding: 10px;")
@@ -495,6 +546,7 @@ class RegionSelector(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self.selecting:
             self.selecting = False
+            self.current_pos = event.pos()
             if self.start_pos and self.current_pos:
                 x = min(self.start_pos.x(), self.current_pos.x())
                 y = min(self.start_pos.y(), self.current_pos.y())
@@ -502,12 +554,26 @@ class RegionSelector(QWidget):
                 h = abs(self.current_pos.y() - self.start_pos.y())
 
                 if w > 10 and h > 10:
-                    self.region_selected.emit((x, y, w, h))
+                    origin = self.mapToGlobal(QPoint(0, 0))
+                    ox, oy = origin.x(), origin.y()
+                    if user32 is not None:
+                        # ClientToScreen returns native desktop coordinates;
+                        # multiplying the global Qt origin breaks mixed-DPI screens.
+                        point = wintypes.POINT()
+                        if user32.ClientToScreen(ctypes.c_void_p(int(self.winId())),
+                                                 ctypes.byref(point)):
+                            ox, oy = point.x, point.y
+                    self.region_selected.emit(physical_region(
+                        (x, y, w, h), (ox, oy), self.devicePixelRatioF()))
             self.close()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.close()
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
 
 
 class ScreenRecorderPro(QMainWindow):
@@ -522,6 +588,11 @@ class ScreenRecorderPro(QMainWindow):
         self.start_time = None
         self.current_output_path = ""
         self._selected_window_rect = None
+        self.region_selector = None
+        self._session_active = False
+        self._stopping = False
+        self._close_pending = False
+        self._recording_error = None
 
         self.init_ui()
 
@@ -556,6 +627,7 @@ class ScreenRecorderPro(QMainWindow):
         self.path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         path_layout.addWidget(self.path_label)
         browse_btn = QPushButton("Browse...")
+        self.browse_btn = browse_btn
         browse_btn.clicked.connect(self.browse_file)
         path_layout.addWidget(browse_btn)
         output_layout.addLayout(path_layout)
@@ -582,6 +654,7 @@ class ScreenRecorderPro(QMainWindow):
         self.window_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         window_layout.addWidget(self.window_combo)
         refresh_btn = QPushButton("Refresh")
+        self.refresh_btn = refresh_btn
         refresh_btn.clicked.connect(self.refresh_windows)
         window_layout.addWidget(refresh_btn)
         self.window_row = QWidget()
@@ -662,6 +735,7 @@ class ScreenRecorderPro(QMainWindow):
 
         preview_btn_layout = QHBoxLayout()
         preview_btn = QPushButton("Preview Webcam")
+        self.preview_btn = preview_btn
         preview_btn.clicked.connect(self.preview_webcam)
         preview_btn_layout.addWidget(preview_btn)
         preview_btn_layout.addStretch()
@@ -791,14 +865,23 @@ class ScreenRecorderPro(QMainWindow):
             self.path_label.setText(folder_path)
 
     def select_region(self):
+        if self._session_active:
+            return
+        if self.region_selector is not None:
+            self.region_selector.raise_()
+            return
         self.region = None
         mode = self.capture_mode_combo.currentText()
         if mode == "Full Screen":
             self.region_label.setText("Full Screen")
             return
-        selector = RegionSelector()
+        selector = self.region_selector = RegionSelector()
         selector.region_selected.connect(self.on_region_selected)
+        selector.closed.connect(self._region_selector_closed)
         selector.showFullScreen()
+
+    def _region_selector_closed(self):
+        self.region_selector = None
 
     def on_region_selected(self, region):
         self.region = region
@@ -811,18 +894,20 @@ class ScreenRecorderPro(QMainWindow):
     # ---- Recording ----
 
     def toggle_recording(self):
-        if self.recording_thread and self.recording_thread.isRunning():
+        if self._session_active:
             self.stop_recording()
         else:
             self.start_recording()
 
     def start_recording(self):
+        if self._session_active or self._close_pending:
+            return
         if not self.output_folder:
             self.browse_file()
             if not self.output_folder:
                 return
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         output_path = f"{self.output_folder}/recording_{timestamp}.mp4"
         self.current_output_path = output_path
 
@@ -882,6 +967,10 @@ class ScreenRecorderPro(QMainWindow):
         self.preview_label.setText("Starting...")
 
         self._set_controls_enabled(False)
+        self._session_active = True
+        self._stopping = False
+        self._recording_error = None
+        self.record_btn.setEnabled(True)
 
         self.recording_thread = RecordingThread(
             output_path, fps, codec, region, record_audio, self.audio_path,
@@ -897,13 +986,15 @@ class ScreenRecorderPro(QMainWindow):
         self.start_time = datetime.now()
 
     def stop_recording(self):
-        if self.recording_thread:
-            self.status_label.setText("Stopping...")
+        if self.recording_thread and self._session_active and not self._stopping:
+            self._stopping = True
+            self.record_btn.setEnabled(False)
+            self.status_label.setText("Finishing recording...")
             self.recording_thread.stop()
 
     def update_progress(self, frame_count):
         self.frame_count_label.setText(f"Frames: {frame_count}")
-        if self.start_time:
+        if self.start_time and not self._stopping:
             elapsed = (datetime.now() - self.start_time).total_seconds()
             self.status_label.setText(f"Recording... ({elapsed:.0f}s)")
 
@@ -916,7 +1007,10 @@ class ScreenRecorderPro(QMainWindow):
         self.preview_label.setPixmap(pixmap)
 
     def recording_finished(self):
+        self._session_active = False
+        self._stopping = False
         self.record_btn.setText("Start Recording")
+        self.record_btn.setEnabled(True)
         self.record_btn.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50; color: white;
@@ -932,24 +1026,45 @@ class ScreenRecorderPro(QMainWindow):
             self.status_label.setText("Recording failed. See the error for details.")
             self.preview_label.setText("Recording was not saved.\nYou can start a new recording.")
             self.start_time = None
+            if self._recording_error:
+                QMessageBox.critical(self, "PyRecorder - Error", self._recording_error)
+                self._recording_error = None
+            if self._close_pending:
+                QTimer.singleShot(0, self.close)
             return
 
         if self.start_time:
-            elapsed = (datetime.now() - self.start_time).total_seconds()
+            elapsed = self.recording_thread.capture_duration
             self.status_label.setText(f"Saved! Duration: {elapsed:.1f}s")
 
-            QMessageBox.information(
-                self, "PyRecorder - Recording Complete",
-                f"Recording saved to:\n{self.current_output_path}\n\n"
-                f"Total frames: {self.frame_count_label.text().split(': ')[1]}\n"
-                f"Duration: {elapsed:.1f} seconds"
-            )
+            if not self._close_pending:
+                QMessageBox.information(
+                    self, "PyRecorder - Recording Complete",
+                    f"Recording saved to:\n{self.current_output_path}\n\n"
+                    f"Total frames: {self.frame_count_label.text().split(': ')[1]}\n"
+                    f"Duration: {elapsed:.1f} seconds"
+                )
 
         self.preview_label.setText("Recording saved.\nStart a new recording to preview.")
         self.start_time = None
+        if self._close_pending:
+            QTimer.singleShot(0, self.close)
 
     def recording_error(self, error_msg):
-        QMessageBox.critical(self, "PyRecorder - Error", f"Recording error:\n{error_msg}")
+        # Show errors only after the native QThread finished signal. A modal
+        # dialog can re-enter the event loop while worker cleanup is pending.
+        self._recording_error = error_msg
+        self.status_label.setText("Recording failed; finishing cleanup...")
+
+    def closeEvent(self, event):
+        if self.region_selector is not None:
+            self.region_selector.close()
+        if self._session_active:
+            self._close_pending = True
+            self.stop_recording()
+            event.ignore()
+            return
+        event.accept()
 
     def _set_controls_enabled(self, enabled):
         self.fps_spinbox.setEnabled(enabled)
@@ -961,6 +1076,9 @@ class ScreenRecorderPro(QMainWindow):
         self.capture_mode_combo.setEnabled(enabled)
         self.window_combo.setEnabled(enabled)
         self.region_btn.setEnabled(enabled)
+        self.browse_btn.setEnabled(enabled)
+        self.refresh_btn.setEnabled(enabled)
+        self.preview_btn.setEnabled(enabled)
 
 
 def main():

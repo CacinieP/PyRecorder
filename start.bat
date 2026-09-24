@@ -32,8 +32,20 @@ for /f "tokens=2" %%i in ('python --version 2^>^&1') do set PY_VERSION=%%i
 echo [OK] Python %PY_VERSION% installed
 echo.
 
-:: Check if pip is available
-python -m pip --version >nul 2>&1
+:: Keep application dependencies separate from the system Python installation.
+set "RECORDER_PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%RECORDER_PYTHON%" (
+    echo Creating project virtual environment...
+    python -m venv "%~dp0.venv"
+    if errorlevel 1 (
+        echo [ERROR] Failed to create the project virtual environment
+        pause
+        exit /b 1
+    )
+)
+
+:: Check pip using the same interpreter used to run the application.
+"%RECORDER_PYTHON%" -m pip --version >nul 2>&1
 if errorlevel 1 (
     color 0C
     echo [ERROR] pip not available. Please reinstall Python with pip
@@ -75,7 +87,7 @@ echo ---------------------------------------------------------------
 echo.
 echo [OK] Starting Basic version...
 echo.
-python screen_recorder.py
+"%RECORDER_PYTHON%" screen_recorder.py
 if errorlevel 1 (
     color 0C
     echo.
@@ -90,7 +102,7 @@ echo ---------------------------------------------------------------
 echo.
 echo [OK] Starting Pro version...
 echo.
-python screen_recorder_pro.py
+"%RECORDER_PYTHON%" screen_recorder_pro.py
 if errorlevel 1 (
     color 0C
     echo.
@@ -111,7 +123,7 @@ echo Installing dependencies, please wait...
 echo.
 
 :: Use the same interpreter and dependency constraints as the application/CI.
-python -m pip install -r "%~dp0requirements.txt" --prefer-binary
+"%RECORDER_PYTHON%" -m pip install -r "%~dp0requirements.txt" --prefer-binary
 if errorlevel 1 (
     color 0C
     echo.

@@ -6,7 +6,7 @@ list and only checked that it *existed* — with Microphone permission denied,
 ffmpeg failed to open it and the whole recording died instead of degrading to
 video-only.
 """
-import stat
+import subprocess
 import sys
 
 import pytest
@@ -69,13 +69,6 @@ def test_first_of_each_class_still_drives_parse_av_devices():
 # probing that the device can actually be opened
 # --------------------------------------------------------------------------
 
-def _stub_ffmpeg(tmp_path, name, script):
-    path = tmp_path / name
-    path.write_text(script)
-    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return str(path)
-
-
 def test_probe_needs_a_device_index():
     assert mac.probe_audio_device(None) is False
 
@@ -84,22 +77,29 @@ def test_probe_reports_false_when_ffmpeg_cannot_run():
     assert mac.probe_audio_device(0, ffmpeg="/nonexistent/ffmpeg") is False
 
 
-def test_probe_follows_the_ffmpeg_exit_code(tmp_path):
-    ok = _stub_ffmpeg(tmp_path, "ffmpeg-ok", "#!/bin/sh\nexit 0\n")
-    bad = _stub_ffmpeg(tmp_path, "ffmpeg-bad", "#!/bin/sh\nexit 251\n")
-    assert mac.probe_audio_device(0, ffmpeg=ok) is True
-    assert mac.probe_audio_device(0, ffmpeg=bad) is False
+@pytest.mark.parametrize("returncode, available", [(0, True), (1, False), (251, False)])
+def test_probe_follows_the_ffmpeg_exit_code(monkeypatch, returncode, available):
+    monkeypatch.setattr(
+        mac.subprocess, "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, returncode),
+    )
+    assert mac.probe_audio_device(0, ffmpeg="test-ffmpeg") is available
 
 
-def test_probe_opens_exactly_the_selected_audio_device(tmp_path):
-    log = tmp_path / "args.txt"
-    spy = _stub_ffmpeg(tmp_path, "ffmpeg-spy",
-                       f'#!/bin/sh\necho "$@" > "{log}"\nexit 0\n')
-    assert mac.probe_audio_device(3, ffmpeg=spy) is True
-    args = log.read_text().split()
-    assert "avfoundation" in args
-    assert ":3" in args, f"must request audio device 3 only, got {args}"
-    assert "-i" in args
+def test_probe_opens_exactly_the_selected_audio_device(monkeypatch):
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(mac.subprocess, "run", run)
+    assert mac.probe_audio_device(3, ffmpeg="test-ffmpeg", timeout=7) is True
+    assert calls == [(
+        ["test-ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "avfoundation",
+         "-i", ":3", "-t", "0.2", "-f", "null", "-"],
+        {"capture_output": True, "text": True, "timeout": 7},
+    )]
 
 
 @pytest.mark.hardware

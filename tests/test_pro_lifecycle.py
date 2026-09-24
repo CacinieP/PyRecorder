@@ -9,7 +9,7 @@ import pytest
 
 
 @pytest.fixture
-def capture(monkeypatch, tmp_path):
+def capture(monkeypatch, tmp_path, qapp):
     import screen_recorder_pro as pro
 
     class Screen:
@@ -94,12 +94,17 @@ def capture(monkeypatch, tmp_path):
     monkeypatch.setattr(pro.cv2, "VideoWriter", writer.open)
     monkeypatch.setattr(pro.cv2, "VideoCapture", lambda *args: camera)
     monkeypatch.setattr(pro, "AudioRecorder", lambda *args: audio)
-    monkeypatch.setattr(pro.cv2, "waitKey", lambda *args: setattr(worker, "is_running", False))
+    monkeypatch.setattr(worker, "_wait_until", lambda *args: worker.stop())
     monkeypatch.setattr(worker, "_emit_preview", lambda *args: None)
     monkeypatch.setattr(pro, "merge_audio_video",
                         lambda video, sound, out: Path(out).write_bytes(b"merged video"))
+    def run_worker():
+        worker.start()
+        assert worker.wait(5000)
+        qapp.processEvents()
+
     return types.SimpleNamespace(
-        pro=pro, worker=worker, screen=screen, writer=writer, camera=camera,
+        pro=pro, worker=worker, screen=screen, writer=writer, camera=camera, run=run_worker,
         audio=audio, output=output, audio_path=audio_path,
         temp=tmp_path / "recording_temp.mp4", merged=tmp_path / "recording_merged.mp4",
         errors=errors, finished=finished,
@@ -108,7 +113,7 @@ def capture(monkeypatch, tmp_path):
 
 def test_capture_preserves_red_channel_and_releases_devices(capture):
     c = capture
-    c.worker.run()
+    c.run()
 
     assert c.writer.frames[0][0, 0].tolist() == [0, 0, 255]
     assert c.output.read_bytes() == b"merged video"
@@ -130,7 +135,7 @@ def test_real_qthread_emits_finished_once(capture, qapp):
 def test_video_only_recording_does_not_open_microphone(capture):
     c = capture
     c.worker.record_audio = False
-    c.worker.run()
+    c.run()
 
     assert c.worker.output_saved and c.output.read_bytes() == b"video headerframe"
     assert not c.audio.started and not c.temp.exists()
@@ -140,7 +145,7 @@ def test_video_only_recording_does_not_open_microphone(capture):
 def test_unavailable_writer_fails_before_opening_camera_or_microphone(capture):
     c = capture
     c.writer.opened = False
-    c.worker.run()
+    c.run()
 
     assert "Cannot open video writer" in c.errors[0]
     assert c.screen.closed and c.writer.released
@@ -152,7 +157,7 @@ def test_unavailable_writer_fails_before_opening_camera_or_microphone(capture):
 def test_invalid_region_closes_screen_before_any_recording(capture):
     c = capture
     c.worker.region = (0, 0, 0, 2)
-    c.worker.run()
+    c.run()
 
     assert "Invalid capture area" in c.errors[0]
     assert c.screen.closed and not c.audio.started and c.writer.path is None
@@ -162,7 +167,7 @@ def test_invalid_region_closes_screen_before_any_recording(capture):
 def test_capture_failure_releases_all_devices_and_preserves_intermediates(capture):
     c = capture
     c.screen.failure = RuntimeError("screen disconnected")
-    c.worker.run()
+    c.run()
 
     assert "screen disconnected" in c.errors[0]
     assert c.screen.closed and c.writer.released and c.camera.released
@@ -175,7 +180,7 @@ def test_capture_failure_releases_all_devices_and_preserves_intermediates(captur
 def test_one_cleanup_failure_does_not_leak_other_devices(capture):
     c = capture
     c.writer.release_failure = RuntimeError("writer close failed")
-    c.worker.run()
+    c.run()
 
     assert "writer close failed" in c.errors[0]
     assert c.screen.closed and c.camera.released and c.audio.stops == 1
@@ -190,7 +195,7 @@ def test_merge_failure_keeps_sources_and_does_not_publish_partial_output(capture
         raise RuntimeError("encoder failed")
 
     monkeypatch.setattr(c.pro, "merge_audio_video", failed_merge)
-    c.worker.run()
+    c.run()
 
     assert "encoder failed" in c.errors[0]
     assert c.merged.read_bytes() == b"partial mp4"
@@ -202,7 +207,7 @@ def test_merge_failure_keeps_sources_and_does_not_publish_partial_output(capture
 def test_missing_microphone_audio_does_not_silently_save_video(capture):
     c = capture
     c.audio.success = False
-    c.worker.run()
+    c.run()
 
     assert "Microphone audio was not recorded" in c.errors[0]
     assert c.temp.exists() and c.audio_path.exists()
@@ -213,7 +218,7 @@ def test_missing_microphone_audio_does_not_silently_save_video(capture):
 def test_stop_before_first_frame_is_not_reported_as_saved(capture):
     c = capture
     c.worker.is_running = False
-    c.worker.run()
+    c.run()
 
     assert "before any video frames" in c.errors[0]
     assert c.screen.closed and c.writer.released and c.camera.released
@@ -226,7 +231,7 @@ def test_existing_recording_or_recovery_file_is_not_overwritten(capture, filenam
     c = capture
     path = getattr(c, filename)
     path.write_bytes(b"previous recording")
-    c.worker.run()
+    c.run()
 
     assert "already exists" in c.errors[0]
     assert path.read_bytes() == b"previous recording"
@@ -237,7 +242,7 @@ def test_existing_recording_or_recovery_file_is_not_overwritten(capture, filenam
 def test_unopened_webcam_is_released(capture):
     c = capture
     c.camera.opened = False
-    c.worker.run()
+    c.run()
     assert c.camera.released and c.worker.output_saved
 
 
@@ -273,3 +278,60 @@ def test_failure_does_not_show_saved_dialog(monkeypatch, qapp):
     assert window.record_btn.isEnabled() and window.fps_spinbox.isEnabled()
     assert window.start_time is None
     window.close()
+
+
+def test_slow_capture_duplicates_frames_to_preserve_wall_clock(capture, monkeypatch):
+    c = capture
+    now = [100.0]
+    grab = c.screen.grab
+    c.worker.fps = 25
+    monkeypatch.setattr(c.pro.time, 'monotonic', lambda: now[0])
+
+    def slow_grab(monitor):
+        now[0] += 0.08  # Device delivers 12.5fps; output must remain 25fps.
+        frame = grab(monitor)
+        if c.screen.grabs == 5:
+            c.worker.stop()
+        return frame
+
+    monkeypatch.setattr(c.screen, 'grab', slow_grab)
+    monkeypatch.setattr(c.worker, '_wait_until', lambda deadline: None)
+    c.run()
+    assert c.worker.output_saved and c.errors == []
+    assert c.screen.grabs == 5 and c.worker.frame_count == 10
+    assert c.worker.capture_duration == pytest.approx(0.4)
+    assert c.worker.frame_count / c.worker.fps == pytest.approx(c.worker.capture_duration)
+
+
+def test_frame_wait_excludes_capture_time_and_tail_ends_at_stop(capture, monkeypatch):
+    c = capture
+    now, waits = [100.0], []
+    grab = c.screen.grab
+    c.worker.fps = 25
+    monkeypatch.setattr(c.pro.time, 'monotonic', lambda: now[0])
+
+    def grab_frame(monitor):
+        now[0] += 0.01
+        return grab(monitor)
+
+    def wait_until(deadline):
+        waits.append(deadline - now[0])
+        now[0] = max(now[0], deadline)
+        if len(waits) == 10:
+            c.worker.stop()
+
+    monkeypatch.setattr(c.screen, 'grab', grab_frame)
+    monkeypatch.setattr(c.worker, '_wait_until', wait_until)
+    c.run()
+    assert waits == pytest.approx([0.03] * 10)
+    assert c.worker.frame_count == 10
+    assert c.worker.capture_duration == pytest.approx(0.4)
+
+
+def test_partial_audio_error_keeps_both_sources(capture):
+    c = capture
+    c.audio.error = 'Audio write failed: disk full'
+    c.run()
+    assert 'disk full' in c.errors[0]
+    assert c.temp.exists() and c.audio_path.exists()
+    assert not c.output.exists() and not c.worker.output_saved

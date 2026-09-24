@@ -4,150 +4,25 @@ A simple screen recording application with GUI
 """
 
 import sys
-import cv2
-import numpy as np
-from mss import mss
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QFileDialog, QComboBox, QGroupBox,
     QMessageBox, QProgressBar
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QIcon
-import threading
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QFont
 from datetime import datetime
 
 
-class RecordingThread(QThread):
-    """Thread for handling screen recording"""
-    progress = pyqtSignal(int)
-    finished = pyqtSignal()
-
-    def __init__(self, output_path, fps, codec, region=None):
-        super().__init__()
-        self.output_path = output_path
-        self.fps = fps
-        self.codec = codec
-        self.region = region
-        self.is_running = True
-        self.recording = True
-        self.frame_count = 0
-
-    def run(self):
-        """Main recording loop"""
-        try:
-            # Setup screen capture
-            sct = mss()
-
-            # Define capture region
-            if self.region:
-                monitor = {"top": self.region[1], "left": self.region[0],
-                          "width": self.region[2], "height": self.region[3]}
-            else:
-                monitor = sct.monitors[1]  # Primary monitor
-
-            # Get screen dimensions
-            width = monitor["width"]
-            height = monitor["height"]
-
-            # Setup video writer
-            fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            out = cv2.VideoWriter(self.output_path, fourcc, self.fps, (width, height))
-
-            self.frame_count = 0
-            last_time = datetime.now()
-
-            while self.is_running:
-                # Capture screen
-                screenshot = sct.grab(monitor)
-
-                # Convert to numpy array
-                img = np.array(screenshot)
-
-                # Convert RGB to BGR for OpenCV
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-                # Write frame
-                out.write(img)
-                self.frame_count += 1
-
-                # Emit progress every second
-                current_time = datetime.now()
-                if (current_time - last_time).seconds >= 1:
-                    self.progress.emit(self.frame_count)
-                    last_time = current_time
-
-                # Control frame rate
-                cv2.waitKey(int(1000 / self.fps))
-
-            # Release resources
-            out.release()
-            self.progress.emit(self.frame_count)
-
-        except Exception as e:
-            print(f"Recording error: {e}")
-
-        self.finished.emit()
-
-    def stop(self):
-        """Stop recording"""
-        self.is_running = False
-        self.wait()
+from screen_recorder_pro import RecordingThread as ProRecordingThread, RegionSelector
 
 
-class RegionSelector(QWidget):
-    """Widget for selecting recording region"""
-    region_selected = pyqtSignal(tuple)
+class RecordingThread(ProRecordingThread):
+    """Use the same capture, timing and recovery guarantees as the Pro edition."""
 
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
-                           Qt.WindowType.WindowStaysOnTopHint |
-                           Qt.WindowType.Tool)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("background-color: rgba(0, 120, 215, 50);")
-        self.setWindowTitle("Select Region")
-
-        self.start_pos = None
-        self.current_pos = None
-        self.selecting = False
-
-        self.setFixedSize(200, 100)
-        self.label = QLabel("Drag to select region\nPress ESC to cancel")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setStyleSheet("color: white; font-weight: bold; background: rgba(0,0,0,150); padding: 10px;")
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.label)
-        self.setLayout(layout)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.selecting = True
-            self.start_pos = event.pos()
-            self.label.hide()
-
-    def mouseMoveEvent(self, event):
-        if self.selecting and self.start_pos:
-            self.current_pos = event.pos()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.selecting:
-            self.selecting = False
-            if self.start_pos and self.current_pos:
-                x = min(self.start_pos.x(), self.current_pos.x())
-                y = min(self.start_pos.y(), self.current_pos.y())
-                w = abs(self.current_pos.x() - self.start_pos.x())
-                h = abs(self.current_pos.y() - self.start_pos.y())
-
-                if w > 10 and h > 10:
-                    self.region_selected.emit((x, y, w, h))
-
-            self.close()
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
-            self.close()
+    def _emit_preview(self, img, width, height):
+        # The basic edition has no preview panel.
+        pass
 
 
 class ScreenRecorder(QMainWindow):
@@ -159,6 +34,11 @@ class ScreenRecorder(QMainWindow):
         self.output_folder = ""
         self.region = None
         self.start_time = None
+        self.region_selector = None
+        self._recording_active = False
+        self._stopping = False
+        self._closing = False
+        self._error_message = None
 
         self.init_ui()
 
@@ -190,9 +70,9 @@ class ScreenRecorder(QMainWindow):
         path_layout.addWidget(QLabel("Save Location:"))
         self.path_label = QLabel("Not selected")
         path_layout.addWidget(self.path_label)
-        browse_btn = QPushButton("Browse...")
-        browse_btn.clicked.connect(self.browse_file)
-        path_layout.addWidget(browse_btn)
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.clicked.connect(self.browse_file)
+        path_layout.addWidget(self.browse_btn)
         output_layout.addLayout(path_layout)
 
         output_group.setLayout(output_layout)
@@ -227,9 +107,12 @@ class ScreenRecorder(QMainWindow):
         region_layout.addWidget(QLabel("Recording Area:"))
         self.region_label = QLabel("Full Screen")
         region_layout.addWidget(self.region_label)
-        region_btn = QPushButton("Select Region")
-        region_btn.clicked.connect(self.select_region)
-        region_layout.addWidget(region_btn)
+        self.region_btn = QPushButton("Select Region")
+        self.region_btn.clicked.connect(self.select_region)
+        region_layout.addWidget(self.region_btn)
+        self.full_screen_btn = QPushButton("Full Screen")
+        self.full_screen_btn.clicked.connect(self.clear_region)
+        region_layout.addWidget(self.full_screen_btn)
         settings_layout.addLayout(region_layout)
 
         settings_group.setLayout(settings_layout)
@@ -293,27 +176,46 @@ class ScreenRecorder(QMainWindow):
 
     def select_region(self):
         """Open region selector"""
-        self.region = None
-        self.region_label.setText("Full Screen")
-
+        if self._recording_active or self._closing:
+            return
+        if self.region_selector is not None:
+            self.region_selector.raise_()
+            return
         selector = RegionSelector()
+        self.region_selector = selector
+        selector.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        selector.destroyed.connect(lambda: self._clear_region_selector(selector))
         selector.region_selected.connect(self.on_region_selected)
         selector.showFullScreen()
+
+    def _clear_region_selector(self, selector):
+        if self.region_selector is selector:
+            self.region_selector = None
 
     def on_region_selected(self, region):
         """Handle region selection"""
         self.region = region
         self.region_label.setText(f"Custom: {region[2]}x{region[3]}")
 
+    def clear_region(self):
+        if self._recording_active or self._closing:
+            return
+        if self.region_selector is not None:
+            self.region_selector.close()
+        self.region = None
+        self.region_label.setText("Full Screen")
+
     def toggle_recording(self):
         """Start or stop recording"""
-        if self.recording_thread and self.recording_thread.isRunning():
+        if self._recording_active:
             self.stop_recording()
         else:
             self.start_recording()
 
     def start_recording(self):
         """Start screen recording"""
+        if self._recording_active or self._closing:
+            return
         # Validate output folder
         if not self.output_folder:
             self.browse_file()
@@ -321,7 +223,7 @@ class ScreenRecorder(QMainWindow):
                 return
 
         # Generate filename with timestamp
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         output_path = f"{self.output_folder}/recording_{timestamp}.mp4"
         self.current_output_path = output_path
 
@@ -347,6 +249,15 @@ class ScreenRecorder(QMainWindow):
         self.progress_bar.setMaximum(0)
         self.progress_bar.setMinimum(0)
 
+        if self.region_selector is not None:
+            self.region_selector.close()
+        self._recording_active = True
+        self._stopping = False
+        self._error_message = None
+        self._set_controls_enabled(False)
+        self.frame_count_label.setText("Frames: 0")
+        self.start_time = datetime.now()
+
         # Start recording thread
         self.recording_thread = RecordingThread(
             output_path,
@@ -356,26 +267,38 @@ class ScreenRecorder(QMainWindow):
         )
         self.recording_thread.progress.connect(self.update_progress)
         self.recording_thread.finished.connect(self.recording_finished)
+        self.recording_thread.error.connect(self.recording_error)
         self.recording_thread.start()
-
-        self.start_time = datetime.now()
 
     def stop_recording(self):
         """Stop screen recording"""
-        if self.recording_thread:
-            self.status_label.setText("Stopping...")
+        if self._recording_active and not self._stopping:
+            self._stopping = True
+            self.record_btn.setEnabled(False)
+            self.status_label.setText("Closing..." if self._closing else "Stopping...")
             self.recording_thread.stop()
 
     def update_progress(self, frame_count):
         """Update recording progress"""
         self.frame_count_label.setText(f"Frames: {frame_count}")
 
-        if self.start_time:
+        if self.start_time and not self._stopping:
             elapsed = (datetime.now() - self.start_time).total_seconds()
             self.status_label.setText(f"Recording... ({elapsed:.0f}s)")
 
     def recording_finished(self):
-        """Handle recording completion"""
+        """Publish the result only after the worker has finished cleanup."""
+        if not self._recording_active:
+            return
+        if self.recording_thread.isRunning():
+            QTimer.singleShot(10, self.recording_finished)
+            return
+        self._recording_active = False
+        self._stopping = False
+        self._set_controls_enabled(True)
+        self.record_btn.setEnabled(True)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
         self.record_btn.setText("Start Recording")
         self.record_btn.setStyleSheet("""
             QPushButton {
@@ -390,16 +313,44 @@ class ScreenRecorder(QMainWindow):
             }
         """)
 
-        if self.start_time:
-            elapsed = (datetime.now() - self.start_time).total_seconds()
-            self.status_label.setText(f"Saved! Duration: {elapsed:.1f}s")
+        self.start_time = None
+        if not self.recording_thread.output_saved:
+            self._closing = False
+            self.status_label.setText("Recording failed. Captured files were kept for recovery.")
+            QMessageBox.critical(
+                self, "PyRecorder - Recording Failed",
+                self._error_message or "Recording could not be saved. Check the output folder.")
+            return
 
+        duration = self.recording_thread.frame_count / self.recording_thread.fps
+        self.status_label.setText(f"Saved! Duration: {duration:.1f}s")
+        if self._closing:
+            self.close()
+            return
         QMessageBox.information(
-            self,
-            "PyRecorder - Recording Complete",
+            self, "PyRecorder - Recording Complete",
             f"Recording saved to:\n{self.current_output_path}\n\n"
-            f"Total frames: {self.frame_count_label.text().split(': ')[1]}"
-        )
+            f"Total frames: {self.recording_thread.frame_count}")
+
+    def recording_error(self, message):
+        # A worker error arrives before its finished signal. Keep the window
+        # alive until cleanup is done, then show a single terminal result.
+        self._error_message = message
+
+    def _set_controls_enabled(self, enabled):
+        for control in (self.fps_spinbox, self.codec_combo,
+                        self.browse_btn, self.region_btn, self.full_screen_btn):
+            control.setEnabled(enabled)
+
+    def closeEvent(self, event):
+        if self.region_selector is not None:
+            self.region_selector.close()
+        if self._recording_active:
+            self._closing = True
+            self.stop_recording()
+            event.ignore()
+            return
+        event.accept()
 
 
 def main():
