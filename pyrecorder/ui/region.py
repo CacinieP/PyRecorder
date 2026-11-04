@@ -8,6 +8,10 @@ Emits `(capture_region, logical_region)`:
   macOS (avfoundation captures points; ffmpeg's crop filter applies the
   scale) or physical desktop pixels on Windows/Linux (the mss feeder grabs
   exactly this rect). The backend decides via ``region_coords_kind()``.
+
+Note: the overlay covers the primary screen, so global logical coordinates
+are primary-screen coordinates — one of the reasons v1 records the primary
+monitor only (docs/product.md).
 """
 from PyQt6.QtCore import QPointF, QRect, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPen

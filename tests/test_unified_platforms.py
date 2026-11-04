@@ -107,6 +107,21 @@ def test_windows_audio_input_args_quote_the_name():
     assert backend.audio_stream_label() == "1:a"
 
 
+def test_windows_enumeration_uses_the_value_form_of_list_devices(monkeypatch):
+    # the bare boolean form is a no-op on ffmpeg 7/8 (verified on 8.1.1)
+    backend = WindowsBackend()
+    seen = []
+
+    def fake_run(args, timeout=20):
+        seen.append(args)
+        return subprocess.CompletedProcess(args, 1, "", DSHOW_LIST)
+
+    monkeypatch.setattr("pyrecorder.ffmpeg_exe.run_tool", fake_run)
+    devices = backend.list_audio_inputs()
+    assert "true" in seen[0] and seen[0][seen[0].index("-list_devices") + 1] == "true"
+    assert len(devices) == 2 and devices[0].id == "Microphone (Realtek(R) Audio)"
+
+
 def test_windows_probe_uses_same_quoting(monkeypatch):
     backend = WindowsBackend()
     seen = []
@@ -148,12 +163,14 @@ def test_linux_audio_input_args():
     assert backend.audio_input_args("default") == ["-f", "pulse", "-i", "default"]
 
 
-def test_linux_wayland_without_x11_is_rejected(monkeypatch):
+def test_linux_wayland_is_rejected_even_with_xwayland(monkeypatch):
+    # XWayland would only capture X11 clients — native Wayland windows would
+    # record as black, which the product promises never happens silently.
     backend = LinuxBackend()
     monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
-    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setenv("DISPLAY", ":0")
     ok, hint = backend.check_screen()
-    assert not ok and "Wayland" in hint
+    assert not ok and "XWayland" in hint
 
 
 def test_linux_x11_accepted_when_mss_reports_monitors(monkeypatch):

@@ -70,6 +70,9 @@ class FakePopenModule:
         def terminate(self):
             pass
 
+        def send_signal(self, sig):
+            pass
+
         def kill(self):
             pass
 

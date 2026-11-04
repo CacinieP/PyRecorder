@@ -32,3 +32,6 @@ c) 按平台择优。
 - 负：屏幕输入有两种形态（原生参数 vs 管道 spec），`build_command` 需同时支持
   ——用 `NativeScreenInput` / `PipeScreenInput` dataclass 显式建模。
 - 负：Win/Linux 成片时长依赖 feeder 节流精度（有测试 + legacy 实测数据背书）。
+- 负：馈送字节流在 Windows 上不能走 `pass_fds` 管道，由
+  `channels.py` 的回环 TCP 通道承载（详见 ADR-0001 的后果与
+  `pyrecorder/channels.py`）。

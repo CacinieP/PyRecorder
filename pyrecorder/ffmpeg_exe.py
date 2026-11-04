@@ -1,13 +1,21 @@
-"""Locate ffmpeg and drain its diagnostic output without blocking.
+"""Locate ffmpeg, spawn it, stop it gracefully, drain its output.
 
 ffmpeg is the only media engine in PyRecorder (ADR-0001). It is resolved from
 PATH, then from a few well-known install locations, then from the optional
 `imageio-ffmpeg` package (`pip install pyrecorder[ffmpeg-binary]`), which
 ships a private static build and keeps the app usable with zero system setup.
+
+Stopping matters as much as starting: ffmpeg must flush the MP4 trailer (moov)
+on the way out. SIGTERM does that on POSIX (exit 255); on Windows
+TerminateProcess does NOT — the recorder therefore spawns ffmpeg in its own
+process group and stops it with CTRL_BREAK_EVENT, which ffmpeg's console
+handler treats like SIGTERM. A hard kill remains the last-resort escalation.
 """
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 
 # Resolution order for the ffmpeg executable. PATH wins so a user's own build
@@ -105,3 +113,34 @@ def run_tool(args, timeout=20):
         )
     except Exception:
         return None
+
+
+def popen_ffmpeg(cmd, **kwargs):
+    """Popen with the platform flags a graceful stop needs later."""
+    if sys.platform == "win32":
+        # CTRL_BREAK_EVENT is delivered per process group, and the default
+        # group would include *us*; give ffmpeg a group of its own.
+        kwargs["creationflags"] = (
+            kwargs.get("creationflags") or 0) | subprocess.CREATE_NEW_PROCESS_GROUP
+    return subprocess.Popen(cmd, **kwargs)
+
+
+def request_graceful_stop(proc):
+    """Ask a running ffmpeg to finalise its output and exit.
+
+    SIGTERM on POSIX (ffmpeg exits 255 after writing the moov trailer);
+    CTRL_BREAK_EVENT on Windows. Falls back to terminate() when the console
+    signal is not deliverable.
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+            return
+        except (OSError, ValueError):
+            pass  # no shared console — take the hard stop below
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        pass  # exited between poll() and the signal

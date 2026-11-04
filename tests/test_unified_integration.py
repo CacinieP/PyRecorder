@@ -17,7 +17,8 @@ from pyrecorder import mp4check  # noqa: E402
 from pyrecorder.camera import CameraPipeFeed  # noqa: E402
 from pyrecorder.channels import open_channel  # noqa: E402
 from pyrecorder.command import CameraInput, PipeScreenInput, build_command  # noqa: E402
-from pyrecorder.ffmpeg_exe import ProcessOutputReader, find_ffmpeg  # noqa: E402
+from pyrecorder.ffmpeg_exe import (ProcessOutputReader, find_ffmpeg,  # noqa: E402
+                                    request_graceful_stop)
 from pyrecorder.screenfeed import ScreenPipeFeed  # noqa: E402
 
 pytestmark = pytest.mark.skipif(find_ffmpeg() is None, reason="needs a real ffmpeg")
@@ -100,12 +101,22 @@ def test_real_ffmpeg_pipeline_screen_plus_camera(qapp, tmp_path):
     cam_feed.start()
 
     time.sleep(SECONDS)
-    proc.terminate()               # production stop path: one SIGTERM
-    rc = proc.wait(timeout=15)
+    # production stop path: EOF every feeder first — ffmpeg finalises and
+    # exits on its own (the only stop that flushes the MP4 trailer on every
+    # platform); escalate to a signal, then a kill, only if it hangs.
     screen_feed.stop()
     cam_feed.stop()
     screen_feed.wait(4000)
     cam_feed.wait(4000)
+    try:
+        rc = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        request_graceful_stop(proc)
+        try:
+            rc = proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = proc.wait(timeout=5)
     stderr_reader.join(2)
 
     assert rc in (0, 255), f"ffmpeg exit {rc}: {stderr_reader.tail_text(500)}"
@@ -126,3 +137,37 @@ def test_real_ffmpeg_pipeline_screen_plus_camera(qapp, tmp_path):
     assert SECONDS * 0.75 <= duration <= SECONDS * 1.5, \
         f"duration {duration}s drifted from the {SECONDS}s session"
     assert extra == []
+
+
+def test_real_ffmpeg_minimal_filterless_command(qapp, tmp_path):
+    """Screen only, no camera/preview/separate: no filter_complex is built,
+    so this guards the plain `-map 0:v` path against real ffmpeg (label
+    syntax like '[0:v]' would be rejected outside a filter graph)."""
+    ffmpeg = find_ffmpeg()
+    output = str(tmp_path / "minimal.mp4")
+    channel = open_channel()
+    cmd, _ = build_command(
+        ffmpeg, output, FPS,
+        screen=PipeScreenInput(channel.input_arg(), SCREEN_SIZE),
+        encoder_main=["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28"])
+    assert "-filter_complex" not in cmd
+    pass_fds = tuple(fd for fd in (channel.pass_fd(),) if fd is not None)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, pass_fds=pass_fds)
+    reader = ProcessOutputReader(proc.stderr)
+    reader.start()
+    channel.after_spawn()
+    feed = ScreenPipeFeed((0, 0, *SCREEN_SIZE), None, FPS, size=SCREEN_SIZE,
+                          mss_factory=FakeMss, sink_factory=channel.connect)
+    feed.start()
+    time.sleep(1.5)
+    feed.stop()
+    feed.wait(4000)
+    try:
+        rc = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        request_graceful_stop(proc)
+        rc = proc.wait(timeout=8)
+    reader.join(2)
+    assert rc in (0, 255), f"ffmpeg exit {rc}: {reader.tail_text(500)}"
+    assert mp4check.recording_succeeded(rc, output)

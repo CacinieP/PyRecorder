@@ -17,8 +17,8 @@ Everything downstream of the inputs (crop guard, bubble overlay, speaker
 layout, live preview, encoders, muxing) is platform-independent.
 """
 import os
-from dataclasses import dataclass, field
-from typing import Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 # The live-preview stream is letterboxed onto this fixed canvas so the reader
 # never has to guess the geometry (it used to, and got Speaker modes wrong).
@@ -163,8 +163,11 @@ def build_command(ffmpeg, output_path, fps, screen, mic=None, camera=None,
 
     if filters:
         cmd += ["-filter_complex", ";".join(filters)]
-
-    cmd += ["-map", base]
+        cmd += ["-map", base]
+    else:
+        # no filter graph: bracket syntax would be invalid ("output with
+        # label '0:v' does not exist in any defined filter graph")
+        cmd += ["-map", "0:v"]
 
     # Audio routing: an extra audio input owns its stream; a native screen
     # input may carry the mic itself (macOS avfoundation, mic=None then).
@@ -197,14 +200,3 @@ def build_command(ffmpeg, output_path, fps, screen, mic=None, camera=None,
         cmd += ["-map", "[prev]", "-f", "rawvideo", "-pix_fmt", "rgb24",
                 "-r", str(fps), "pipe:1"]
     return cmd, extra_files
-
-
-@dataclass
-class CommandPlan:
-    """Everything the caller needs to launch one recording session."""
-    cmd: list = field(default_factory=list)
-    extra_files: list = field(default_factory=list)
-    screen_pipe_write_fd: Optional[int] = None   # feeder writes here (win/linux)
-    camera_pipe_write_fd: Optional[int] = None   # camera feed writes here
-    camera_fps: Optional[float] = None
-    camera_size: Optional[Tuple[int, int]] = None

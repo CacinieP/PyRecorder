@@ -81,6 +81,9 @@ class ScreenPipeFeed(QThread):
                     return
                 due, next_due = frames_due(next_due, time.monotonic(), interval)
                 if not due:
+                    # not due yet: sleep instead of re-grabbing in a busy loop
+                    # (small regions would otherwise spin one core)
+                    time.sleep(max(0.0, next_due - time.monotonic()))
                     continue
                 for _ in range(due):
                     if self._stop or not sink.write(payload):

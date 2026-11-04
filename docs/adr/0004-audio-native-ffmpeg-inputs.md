@@ -20,8 +20,9 @@ legacy Windows Pro 用 PyAudio 录 WAV 再合并（已在 ADR-0001 中废除）�
 用 `-t 0.2` 的空录制**实探**一次（约 0.4s，后台线程）：打不开就弹窗降级为
 纯视频，不启动带音频的命令。设备枚举：
 
-- mac：解析 `-list_devices`（avfoundation，含 BlackHole 等虚拟声卡）；
-- Win：解析 dshow 设备列表，设备名内嵌双引号转义；
+- mac：解析 `-list_devices true`（avfoundation，含 BlackHole 等虚拟声卡）；
+- Win：解析 dshow 设备列表（注意 `-list_devices` 必须带值 `true`，裸布尔形式在
+  ffmpeg 7/8 是 no-op——实测 8.1.1）；设备名整体包进字面双引号；
 - Linux：`pactl list short sources`（保留 monitor 源——这是录系统声音最简单的
   合法通道），无 pactl 时回退 `default`。
 

@@ -114,6 +114,8 @@ def test_linux_pulse_audio_without_camera():
     assert "-filter_complex" not in cmd         # nothing to filter
     assert extra == []
     assert "alsa_input.pci-0000_00_1f.3" in cmd
+    # with no filter graph the label syntax would be invalid; expect 0:v
+    assert "-map" in cmd and "0:v" in cmd and "[0:v]" not in cmd
 
 
 def test_no_audio_when_mic_missing_or_degraded():

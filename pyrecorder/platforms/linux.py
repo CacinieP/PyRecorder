@@ -62,11 +62,16 @@ class LinuxBackend(Backend):
 
     def check_screen(self):
         session = os.environ.get("XDG_SESSION_TYPE", "").lower()
-        if session == "wayland" and not os.environ.get("DISPLAY"):
+        if session == "wayland":
+            # Even with XWayland available (DISPLAY set), mss would only see
+            # X11 clients — native Wayland windows would record as black. The
+            # product promises never to record a silent black screen.
             return False, (
-                "Wayland sessions cannot be captured by this recorder yet.\n\n"
-                "Options: log into an X11/Xorg session, or use a tool with\n"
-                "PipeWire portal support (e.g. OBS Studio) for Wayland.")
+                "Wayland sessions cannot be captured reliably by this recorder yet.\n"
+                "(Under XWayland only X11 application windows would be visible;\n"
+                "native Wayland windows would record as black.)\n\n"
+                "Options: log into an X11/Xorg session at the login screen, or\n"
+                "use a tool with PipeWire portal support (e.g. OBS Studio).")
         try:
             import mss
             with mss.mss() as sct:

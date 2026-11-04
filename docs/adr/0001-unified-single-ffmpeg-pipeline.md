@@ -25,7 +25,13 @@ VideoToolbox 编码）直接出片，真机验证稳定。
 ## 后果
 
 - 正：停止后即刻拿到成品；音画天然同步（同一时钟编码）；失败面收敛为
-  「ffmpeg 进退码 + moov 完整性」一个判定。
+  「ffmpeg 退码 + moov 完整性」一个判定。
 - 正：`build_command()` 成为唯一需要跨平台测试的编排点，纯函数、易测。
+- 正：**停止即 EOF**——关闭全部 rawvideo 输入的通道（`channels.py`）后 ffmpeg
+  自行写 trailer 干净退出（退出码 0）；这是三平台统一的收尾语义（Windows 上
+  TerminateProcess 硬杀无法落盘 moov，CI 实测）。
 - 负：ffmpeg 成为硬依赖（用 `[ffmpeg-binary]` extra 携带静态二进制缓解）；
   无法在录制中途动态增删输入（接受，教学场景不需要）。
+- 负：Windows 的 subprocess 不支持 `pass_fds`，多输入字节流改走
+  `tcp://127.0.0.1:<port>?listen=1` 回环通道（`pyrecorder/channels.py`；
+  CI Windows 腿用真 ffmpeg 集成测试覆盖该路径）。

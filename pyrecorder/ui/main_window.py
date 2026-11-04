@@ -26,7 +26,9 @@ from pyrecorder.camera import (CameraPipeFeed, clamp_pip, pipe_camera_size,
 from pyrecorder.channels import open_channel
 from pyrecorder.command import (CameraInput, ExtraAudioInput, NativeScreenInput,
                                 PipeScreenInput, build_command)
-from pyrecorder.ffmpeg_exe import ProcessOutputReader, find_ffmpeg, install_hint
+from pyrecorder.ffmpeg_exe import (ProcessOutputReader, find_ffmpeg,
+                                    install_hint, popen_ffmpeg,
+                                    request_graceful_stop)
 from pyrecorder.mp4check import recording_succeeded
 from pyrecorder.pacing import pick_camera_fps
 from pyrecorder.screenfeed import ScreenPipeFeed, even_size
@@ -109,6 +111,7 @@ class RecorderWindow(QMainWindow):
         self._stop_requested = False
         self._stop_started = None
         self._kill_requested = False
+        self._signaled_ffmpeg = False
         self._session = 0
         self._state = "idle"
         self._closing = False
@@ -275,12 +278,19 @@ class RecorderWindow(QMainWindow):
                 "Then restart PyRecorder.")
             return
         self.status_label.setText("Detecting devices…")
-        self.device_thread = DeviceListThread(self.backend)
-        self.device_thread.done.connect(self._on_devices_listed)
-        self.device_thread.start()
+        thread = DeviceListThread(self.backend)
+        self.device_thread = thread
+        thread.done.connect(self._on_devices_listed)
+        # The worker may still be finishing when its result is delivered;
+        # destroy it only from its own finished signal.
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._device_thread_finished)
+        thread.start()
+
+    def _device_thread_finished(self):
+        self.device_thread = None
 
     def _on_devices_listed(self, result):
-        self.device_thread = None
         if self._closing or self._state != "idle":
             return
         self._populate_mic_combo(result.get("devices", []))
@@ -542,7 +552,7 @@ class RecorderWindow(QMainWindow):
             # channels carry no fds (ffmpeg connects over loopback TCP).
             pass_fds = [fd for fd in (ch.pass_fd() for ch in channels)
                         if fd is not None]
-            self.proc = subprocess.Popen(
+            self.proc = popen_ffmpeg(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, pass_fds=tuple(pass_fds))
         except Exception as e:
@@ -608,21 +618,36 @@ class RecorderWindow(QMainWindow):
         self.status_label.setText("Screen capture failed — stopping…")
 
     def stop_recording(self):
-        """Signal ffmpeg once, then let the event loop wait for its trailer."""
+        """Stop feeders first (EOF), then escalate to a signal only if needed.
+
+        Closing every rawvideo input lets ffmpeg drain its filter graph and
+        write the MP4 trailer by itself — verified against real ffmpeg on both
+        channel flavors, and the only stop primitive that works on Windows
+        (TerminateProcess never flushes). Native inputs (avfoundation) cannot
+        EOF, so those get SIGTERM/CTRL_BREAK straight away; hard kill stays
+        the last-resort escalation.
+        """
         if self.proc is None or self._stop_requested:
             return
         self._stop_requested = True
         self._state = "stopping"
         self._stop_started = time.monotonic()
         self._kill_requested = False
+        self._signaled_ffmpeg = False
         self.record_btn.setEnabled(False)
         self.status_label.setText("Stopping…")
-        if self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-            except ProcessLookupError:
-                pass  # ffmpeg exited between poll() and the signal
+        for worker in (self.cam_feed, self.screen_feed):
+            if worker is not None:
+                worker.stop()               # EOF on every pipe input
+        if self.backend.screen_capture_kind() == "native":
+            self._signal_ffmpeg()           # native inputs never EOF
         self.lifecycle_timer.start()
+
+    def _signal_ffmpeg(self):
+        if self._signaled_ffmpeg or self.proc is None or self.proc.poll() is not None:
+            return
+        self._signaled_ffmpeg = True
+        request_graceful_stop(self.proc)
 
     def _poll_lifecycle(self):
         """Observe process/thread completion without blocking the GUI."""
@@ -638,13 +663,18 @@ class RecorderWindow(QMainWindow):
         if proc is not None:
             if proc.poll() is not None:
                 self._finalize(self._session)
-            elif (self._stop_requested and not self._kill_requested
-                  and time.monotonic() - self._stop_started >= 15):
-                self._kill_requested = True
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+            elif self._stop_requested:
+                # pipe platforms: give EOF a few seconds to finalise before
+                # signalling; then a few more before the hard kill
+                age = time.monotonic() - self._stop_started
+                if age >= 5:
+                    self._signal_ffmpeg()
+                if age >= 15 and not self._kill_requested:
+                    self._kill_requested = True
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
         if self._closing:
             self._finish_close()
         elif (self.proc is None and self._state == "idle"
@@ -745,12 +775,13 @@ class RecorderWindow(QMainWindow):
         self._pending = None
         if self.probe_thread and self.probe_thread.isRunning():
             self.probe_thread.requestInterruption()
-        if self.device_thread and self.device_thread.isRunning():
-            self.device_thread.wait(3000)
         self._close_pip_bubble()
         if self.proc is not None:
             self.stop_recording()
         if self._shutdown_pending():
+            # Stay alive until ffmpeg, the feeders and every probe/enumeration
+            # worker has finished (a blocked device enumeration can outlive a
+            # fixed wait; destroying its QThread would abort the process).
             event.ignore()
             self.record_btn.setEnabled(False)
             self._set_controls(False)
@@ -763,7 +794,8 @@ class RecorderWindow(QMainWindow):
 
     def _shutdown_pending(self):
         return (self.proc is not None or bool(self._retired_pip_windows)
-                or bool(self.probe_thread and self.probe_thread.isRunning()))
+                or bool(self.probe_thread and self.probe_thread.isRunning())
+                or bool(self.device_thread and self.device_thread.isRunning()))
 
     def _finish_close(self):
         if not self._shutdown_pending():

@@ -63,9 +63,18 @@ class PipPreviewWindow(QWidget):
         self.thread = CameraFrameThread(camera_idx, platform_id)
         self.thread.frame.connect(self.on_frame)
         self.thread.failed.connect(self.on_failed)
+        # a machine without a camera must not leave a dead bubble on screen
+        self.thread.unavailable.connect(self._on_unavailable)
         self.thread.finished.connect(self._finish_close)
         self._closing = False
         self.thread.start()
+
+    def _on_unavailable(self, message):
+        self.video_label.setText("Camera unavailable\n" + message)
+        self._closing = True
+        self.thread.stop()
+        if not self.thread.isRunning():
+            self.close()
 
     def _reposition_overlays(self, grip=None):
         grip = grip or self.findChild(QSizeGrip)

@@ -37,7 +37,10 @@ class WindowsBackend(Backend):
 
     def list_audio_inputs(self):
         from pyrecorder.ffmpeg_exe import run_tool
-        proc = run_tool(["-list_devices", "-f", "dshow", "-i", "dummy"], timeout=20)
+        # The bare boolean form ("-list_devices") is a no-op on ffmpeg 7/8 —
+        # the value form lists devices (verified against ffmpeg 8.1.1).
+        proc = run_tool(["-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                        timeout=20)
         if proc is None:
             return []
         _, mics = parse_dshow_device_lists(proc.stderr)

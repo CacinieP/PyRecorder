@@ -6,13 +6,13 @@
 ## 录制管线
 
 ```
-                ┌─────────────────────────── 平台后端 (platforms/) ──────────────────────────┐
-                │                                                                           │
-   macOS        │  avfoundation:  "-i <screen>:<mic>"  （光标含在内，麦克风同路）              │
-   Win/Linux    │  mss ──BGRA──▶ ScreenPipeFeed ──rawvideo pipe──┐        dshow/pulse mic     │
-                └────────────────────────────────────────────────┼──────────────────────────┘
+                ┌─────────────────── 平台后端 (platforms/) ───────────────────┐
+                │                                                                │
+   macOS        │  avfoundation:  "-i <screen>:<mic>"  （光标含在内，麦克风同路）   │
+   Win/Linux    │  mss ──BGRA──▶ ScreenPipeFeed ──通道(管道/TCP)──┐  dshow/pulse │
+                └─────────────────────────────────────────────────┼─────────────┘
                                                                            │
-   所有平台     │  OpenCV ──BGR──▶ CameraPipeFeed ──rawvideo pipe──┐        │
+   所有平台     │  OpenCV ──BGR──▶ CameraPipeFeed ──通道(管道/TCP)──┐        │
                 └──────────────────────────────────────────────────┼────────┤
                                                                      ▼        ▼
    ffmpeg 单进程:  [screen] ─crop/even-guard→ ─split→ ┐
@@ -22,11 +22,20 @@
                                                              └─→ 480×270 rgb24 预览流 ─→ LivePreviewWindow
 ```
 
+### 通道（channels/）：馈送线程 → ffmpeg 的字节流
+
+Windows 的 subprocess **不支持 `pass_fds`**（CI 实测 AssertionError），所以馈送通道按平台二选一
+（`pyrecorder/channels.py`）：
+
+- **POSIX**：`os.pipe` + `pass_fds`，ffmpeg 读 `pipe:N`（legacy 验证过的原路径）
+- **Windows**：ffmpeg 监听回环地址，输入写 `tcp://127.0.0.1:<port>?listen=1`，馈送线程连上去
+  `sendall`——ffmpeg 内建协议、字节数学完全一致、回环绑定不触发防火墙弹窗
+
 关键不变量（每一条都有测试或实测数据背书，见 [known-issues.md](known-issues.md)）：
 
 - **每个输出都显式 `-r <fps>`**：avfoundation 会报 `1000k tbr`，不固定帧率会触发复制帧风暴（曾 8 秒推 51654 帧、成片 0 字节）
 - **管道没有时间戳**：feeder 必须按声明帧率节流（`frames_due()`：落后补帧、>2s 卡顿才重对齐），否则成片比会话短
-- **停止只发一次 SIGTERM**：第二次信号会打断 muxer flush，产出有体积但无 moov 的废片；成功判定 = 退出码 ∈ {0,255} **且** moov 存在
+- **停止 = EOF 优先，信号兜底**：先停所有馈送线程（关闭通道 → 全部 rawvideo 输入 EOF）→ ffmpeg 自行排空滤镜图并写 moov 干净退出（真 ffmpeg 实测退出码 0，且这是 Windows 上唯一能落盘 trailer 的停止方式——TerminateProcess 是硬杀）；5 秒未退再发 SIGTERM/CTRL_BREAK，15 秒才 kill。成功判定 = 退出码 ∈ {0,255} **且** moov 存在
 - **GUI 线程永不阻塞**：设备枚举、录制前探测、ffmpeg 收尾全部在后台线程/定时器轮询
 - **降级优于失败**：摄像头/麦克风探测不过 → 弹窗 + 去掉该路继续录；屏幕不可用才中止
 
@@ -38,6 +47,7 @@ pyrecorder/
 ├── pacing.py          frames_due / estimate_fps —— 管道节流的全部数学
 ├── mp4check.py        moov box 遍历 + 成功判定
 ├── command.py         build_command(): 平台无关的滤镜图与输出组装（输入用 spec 对象描述）
+├── channels.py        馈送线程→ffmpeg 的字节流通道：POSIX 管道 / Windows 回环 TCP 监听
 ├── camera.py          OpenCV 摄像头：探测（帧率+分辨率）、预览线程、录制馈送线程、letterbox/clamp
 ├── screenfeed.py      mss 屏幕馈送（Win/Linux）：BGRA 直通管道，无逐帧 numpy 转换
 ├── platforms/

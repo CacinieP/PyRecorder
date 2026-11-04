@@ -135,9 +135,11 @@ class CameraFrameThread(QThread):
     """Live camera preview for the floating bubble — the same platform capture
     path the recorder uses."""
     frame = pyqtSignal(object)
-    failed = pyqtSignal(str)
+    failed = pyqtSignal(str)           # transient: reconnecting / message only
+    unavailable = pyqtSignal(str)      # permanent: no camera, stop retrying
 
     MAX_BAD_READS = 30
+    OPEN_ATTEMPTS = 3
 
     def __init__(self, camera_idx, platform_id):
         super().__init__()
@@ -155,13 +157,15 @@ class CameraFrameThread(QThread):
             try:
                 self.cap = open_camera(self.camera_idx, self.platform_id)
             except Exception as e:
-                self.failed.emit(str(e))
+                self.unavailable.emit(str(e))
                 return
             if not self.cap.isOpened():
                 attempt += 1
-                if attempt > 3:
-                    self.failed.emit("Cannot open camera (check permission "
-                                     "or other apps using it).")
+                if attempt > self.OPEN_ATTEMPTS:
+                    # never opened at all: no point keeping a dead bubble
+                    self.unavailable.emit(
+                        "Cannot open camera (check permission, connection "
+                        "or other apps using it).")
                     return
                 time.sleep(0.5)
                 continue

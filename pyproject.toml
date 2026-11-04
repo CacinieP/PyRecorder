@@ -27,13 +27,17 @@ dependencies = [
     "PyQt6>=6.7,<7",
     "opencv-python>=4.8",
     "numpy>=1.26",
+    # screen capture for the Windows/Linux feeders (the unified runtime
+    # dependency; the legacy extra used to be the only place it lived)
+    "mss>=9",
 ]
 
 [project.optional-dependencies]
 # Ships a private static ffmpeg binary — the zero-system-setup option.
 ffmpeg-binary = ["imageio-ffmpeg"]
 # The frozen legacy editions (legacy/) still use the old two-step pipeline.
-legacy = ["mss==9.0.1", "pyaudio==0.2.14", "moviepy>=2.0", "Pillow>=10.2"]
+# (mss comes from the base dependencies now.)
+legacy = ["pyaudio==0.2.14", "moviepy>=2.0", "Pillow>=10.2"]
 dev = ["pytest>=8,<10", "flake8>=7,<8"]
 
 [project.scripts]
