@@ -1,16 +1,13 @@
 #!/bin/bash
-# PyRecorder for macOS launcher (double-click in Finder)
+# PyRecorder launcher for macOS (double-click in Finder).
+# Creates a project venv on first run; the [ffmpeg-binary] extra ships a
+# private ffmpeg so no Homebrew setup is needed.
 set -euo pipefail
 cd "$(dirname "$0")"
-
-if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/ffmpeg ]; then
-    echo "ffmpeg not found. Install it with:  brew install ffmpeg"
-    exit 1
-fi
 
 if [ ! -d .venv ]; then
     python3 -m venv .venv
 fi
-.venv/bin/python -m pip install -q -r requirements-mac.txt
+.venv/bin/python -m pip install -q -e ".[ffmpeg-binary]"
 
-exec .venv/bin/python screen_recorder_mac.py
+exec .venv/bin/python -m pyrecorder

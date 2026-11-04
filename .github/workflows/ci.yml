@@ -17,16 +17,12 @@ jobs:
         include:
           - os: ubuntu-latest
             python-version: '3.11'
-            requirements: requirements.txt
           - os: ubuntu-latest
             python-version: '3.12'
-            requirements: requirements.txt
           - os: windows-latest
             python-version: '3.12'
-            requirements: requirements.txt
           - os: macos-latest
             python-version: '3.12'
-            requirements: requirements-mac.txt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,8 +31,9 @@ jobs:
       - name: Install system libraries
         if: runner.os == 'Linux'
         # PyQt6 needs EGL/GL/xkbcommon at runtime (tests run with the offscreen
-        # platform plugin); portaudio lets pyaudio build from its sdist; ffmpeg
-        # (+ffprobe) is used to build and inspect real media fixtures.
+        # platform plugin); portaudio lets pyaudio build from its sdist if no
+        # wheel matches; ffmpeg (+ffprobe) builds and inspects real media
+        # fixtures for both the unified pipeline and the frozen legacy tests.
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 \
@@ -68,7 +65,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r ${{ matrix.requirements }} -r requirements-test.txt
+          python -m pip install -e ".[dev,legacy]"
       - name: Run tests
         run: python -m pytest -q
       - name: Lint with flake8
