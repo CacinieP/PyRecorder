@@ -44,6 +44,8 @@ jobs:
           if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
             brew install ffmpeg
           fi
+          # pyaudio (legacy extra) builds from sdist on arm64 runners
+          brew install portaudio
       - name: Install Windows media tools
         if: runner.os == 'Windows'
         run: |

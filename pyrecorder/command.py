@@ -33,7 +33,7 @@ class NativeScreenInput:
 
 @dataclass
 class PipeScreenInput:
-    pipe_fd: int
+    source: object            # int pipe fd ("pipe:N") or str input URL (tcp://)
     size: Tuple[int, int]     # declared (w, h), already even
 
 
@@ -45,7 +45,7 @@ class ExtraAudioInput:
 
 @dataclass
 class CameraInput:
-    pipe_fd: int
+    source: object            # int pipe fd ("pipe:N") or str input URL (tcp://)
     fps: float                # measured delivery rate — becomes the camera clock
     size: Tuple[int, int]
 
@@ -54,12 +54,17 @@ def _even(value):
     return int(value) & ~1
 
 
-def _rawvideo_input(pipe_fd, size, fps, pix_fmt):
+def _source_arg(source):
+    """Channel input as ffmpeg sees it: fd number or ready-made URL."""
+    return source if isinstance(source, str) else f"pipe:{int(source)}"
+
+
+def _rawvideo_input(source, size, fps, pix_fmt):
     size_str = f"{int(size[0])}x{int(size[1])}"
     return ["-f", "rawvideo", "-pix_fmt", pix_fmt,
             "-video_size", size_str,
             "-framerate", str(round(float(fps), 3)),
-            "-i", f"pipe:{pipe_fd}"]
+            "-i", _source_arg(source)]
 
 
 def _secondary_path(output_path, suffix):
@@ -91,7 +96,7 @@ def build_command(ffmpeg, output_path, fps, screen, mic=None, camera=None,
     if isinstance(screen, NativeScreenInput):
         cmd += screen.input_args
     else:
-        cmd += _rawvideo_input(screen.pipe_fd, screen.size, fps, "bgra")
+        cmd += _rawvideo_input(screen.source, screen.size, fps, "bgra")
 
     if mic is not None and isinstance(mic, ExtraAudioInput):
         cmd += mic.input_args
@@ -100,7 +105,7 @@ def build_command(ffmpeg, output_path, fps, screen, mic=None, camera=None,
     if camera is not None:
         # inputs are ordered screen(0), extra audio(1), camera(next)
         camera_index = 1 + (1 if isinstance(mic, ExtraAudioInput) else 0)
-        cmd += _rawvideo_input(camera.pipe_fd, camera.size, camera.fps, "bgr24")
+        cmd += _rawvideo_input(camera.source, camera.size, camera.fps, "bgr24")
 
     filters = []
     base = "[0:v]"

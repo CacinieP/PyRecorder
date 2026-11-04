@@ -6,7 +6,6 @@ build_command, both pipe feeders, pacing under the GIL, SIGTERM stop,
 moov-based success check. This is the exact runtime path Windows and Linux
 take (ADR-0002), executed here against whatever real ffmpeg is installed.
 """
-import os
 import subprocess
 import time
 
@@ -16,6 +15,7 @@ pytest.importorskip("PyQt6", reason="pyrecorder imports PyQt6 at module level")
 
 from pyrecorder import mp4check  # noqa: E402
 from pyrecorder.camera import CameraPipeFeed  # noqa: E402
+from pyrecorder.channels import open_channel  # noqa: E402
 from pyrecorder.command import CameraInput, PipeScreenInput, build_command  # noqa: E402
 from pyrecorder.ffmpeg_exe import ProcessOutputReader, find_ffmpeg  # noqa: E402
 from pyrecorder.screenfeed import ScreenPipeFeed  # noqa: E402
@@ -69,29 +69,33 @@ def test_real_ffmpeg_pipeline_screen_plus_camera(qapp, tmp_path):
     ffmpeg = find_ffmpeg()
     output = str(tmp_path / "integration.mp4")
 
-    screen_r, screen_w = os.pipe()
-    cam_r, cam_w = os.pipe()
-    os.set_inheritable(screen_r, True)
-    os.set_inheritable(cam_r, True)
+    # production channel flavor for this platform (pipes on POSIX, loopback
+    # TCP on Windows where pass_fds does not exist)
+    screen_channel = open_channel()
+    cam_channel = open_channel()
 
     cmd, extra = build_command(
         ffmpeg, output, FPS,
-        screen=PipeScreenInput(screen_r, SCREEN_SIZE),
-        camera=CameraInput(cam_r, FPS, CAMERA_SIZE),
+        screen=PipeScreenInput(screen_channel.input_arg(), SCREEN_SIZE),
+        camera=CameraInput(cam_channel.input_arg(), FPS, CAMERA_SIZE),
         pip=(160, 20, 20), layout="pip",
         encoder_main=["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28"])
+    pass_fds = tuple(fd for fd in (screen_channel.pass_fd(), cam_channel.pass_fd())
+                     if fd is not None)
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE, pass_fds=(screen_r, cam_r))
+        stderr=subprocess.PIPE, pass_fds=pass_fds)
     stderr_reader = ProcessOutputReader(proc.stderr)
     stderr_reader.start()
-    os.close(screen_r)
-    os.close(cam_r)
+    screen_channel.after_spawn()
+    cam_channel.after_spawn()
 
-    screen_feed = ScreenPipeFeed((0, 0, *SCREEN_SIZE), screen_w, FPS,
-                                 size=SCREEN_SIZE, mss_factory=FakeMss)
-    cam_feed = CameraPipeFeed(0, "darwin", cam_w, FPS, size=CAMERA_SIZE,
-                              opener=lambda idx: FakeCamera())
+    screen_feed = ScreenPipeFeed((0, 0, *SCREEN_SIZE), None, FPS,
+                                 size=SCREEN_SIZE, mss_factory=FakeMss,
+                                 sink_factory=screen_channel.connect)
+    cam_feed = CameraPipeFeed(0, "darwin", None, FPS, size=CAMERA_SIZE,
+                              opener=lambda idx: FakeCamera(),
+                              sink_factory=cam_channel.connect)
     screen_feed.start()
     cam_feed.start()
 

@@ -182,7 +182,8 @@ def test_pipe_platform_command_uses_screen_and_audio_pipes(window):
     assert len(FakePopenModule.commands) == 1
     cmd = FakePopenModule.commands[0]
     inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
-    assert inputs[0].startswith("pipe:")       # mss screen
+    # mss screen arrives over a channel: pipe: on POSIX, tcp:// on Windows
+    assert inputs[0].startswith(("pipe:", "tcp://"))
     assert inputs[1] == "0"                    # pulse "default" style input
     assert "bgra" in cmd and "libx264" in cmd
     assert win._state == "idle"

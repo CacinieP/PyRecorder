@@ -4,12 +4,12 @@ ffmpeg's own camera demuxers misbehave (frozen frames on some macOS devices),
 so the camera is always captured through OpenCV's platform backend and pushed
 into the recording process through a rawvideo pipe (ADR-0003).
 """
-import os
 import time
 
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
+from pyrecorder.channels import FdSink
 from pyrecorder.pacing import estimate_fps, frames_due
 
 # The preview bubble letterboxes onto this size; most modern cams deliver
@@ -190,21 +190,24 @@ class CameraFrameThread(QThread):
 
 
 class CameraPipeFeed(QThread):
-    """Capture the camera with OpenCV and write raw BGR frames into the pipe
-    that ffmpeg reads as an input. Closing the pipe signals EOF."""
+    """Capture the camera with OpenCV and write raw BGR frames into the stream
+    that ffmpeg reads as an input. Closing the stream signals EOF."""
     failed = pyqtSignal(str)
     MAX_BAD_READS = 30
     RETRY_DELAY = 0.1
 
-    def __init__(self, camera_idx, platform_id, write_fd, fps, size=None, opener=None):
+    def __init__(self, camera_idx, platform_id, write_fd, fps, size=None,
+                 opener=None, sink_factory=None):
         super().__init__()
         self.camera_idx = camera_idx
         self.platform_id = platform_id
-        self.write_fd = write_fd
         self.fps = fps
         # geometry the pipe promised ffmpeg; frames are resized to match it
         self.size = tuple(size) if size else CAMERA_CAPTURE_SIZE
         self._opener = opener or (lambda idx: open_camera(idx, platform_id))
+        # `write_fd` keeps the historical (test-facing) signature; production
+        # passes a channel sink_factory (pipes on POSIX, TCP on Windows).
+        self._sink_factory = sink_factory or (lambda: FdSink(write_fd))
         self._stop = False
         self.failure_reason = None
 
@@ -220,12 +223,14 @@ class CameraPipeFeed(QThread):
     def run(self):
         import cv2
         cap = None
+        sink = None
         try:
             cap = self._opener(self.camera_idx)
             if cap is None or not cap.isOpened():
                 if not self._stop:
                     self._fail("Camera opened by recorder failed.")
                 return
+            sink = self._sink_factory()
             target = self.size
             # ffmpeg timestamps this pipe from the declared framerate alone, so
             # write on exactly that clock (duplicating when the device is slow).
@@ -257,14 +262,7 @@ class CameraPipeFeed(QThread):
                     continue
                 payload = last.tobytes()
                 for _ in range(due):
-                    try:
-                        remaining = memoryview(payload)
-                        while remaining and not self._stop:
-                            written = os.write(self.write_fd, remaining)
-                            if written <= 0:
-                                return
-                            remaining = remaining[written:]
-                    except OSError:
+                    if self._stop or not sink.write(payload):
                         return  # reader gone — recording stopped
         except Exception as exc:
             if not self._stop:
@@ -275,7 +273,5 @@ class CameraPipeFeed(QThread):
                     cap.release()
                 except Exception:
                     pass
-            try:
-                os.close(self.write_fd)  # EOF for ffmpeg
-            except OSError:
-                pass
+            if sink is not None:
+                sink.close()  # EOF for ffmpeg

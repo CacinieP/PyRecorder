@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
 from pyrecorder import __version__
 from pyrecorder.camera import (CameraPipeFeed, clamp_pip, pipe_camera_size,
                                probe_camera)
+from pyrecorder.channels import open_channel
 from pyrecorder.command import (CameraInput, ExtraAudioInput, NativeScreenInput,
                                 PipeScreenInput, build_command)
 from pyrecorder.ffmpeg_exe import ProcessOutputReader, find_ffmpeg, install_hint
@@ -503,16 +504,14 @@ class RecorderWindow(QMainWindow):
         if cam_on:
             cam_size = pipe_camera_size(native, p["layout"], p["separate"], pip[0])
 
-        pass_fds = []
+        channels = []
         camera = screen_input = mic_input = None
-        self._cam_pipe_write_fd = self._screen_pipe_write_fd = None
         try:
             if cam_on:
-                r, w = os.pipe()
-                os.set_inheritable(r, True)
-                camera = CameraInput(r, cam_fps or p["fps"], cam_size)
-                pass_fds.append(r)
-                self._cam_pipe_write_fd = w
+                cam_channel = open_channel()
+                channels.append(cam_channel)
+                camera = CameraInput(cam_channel.input_arg(), cam_fps or p["fps"],
+                                     cam_size)
 
             if self.backend.screen_capture_kind() == "native":
                 mic_arg = p["mic_device"] if mic_on else None
@@ -520,12 +519,11 @@ class RecorderWindow(QMainWindow):
                     self.backend.native_screen_args(p["fps"], mic_arg),
                     audio_stream="0:a" if mic_on else None)
             else:
-                r, w = os.pipe()
-                os.set_inheritable(r, True)
+                screen_channel = open_channel()
+                channels.append(screen_channel)
                 screen_input = PipeScreenInput(
-                    r, (self._capture_rect[2], self._capture_rect[3]))
-                pass_fds.append(r)
-                self._screen_pipe_write_fd = w
+                    screen_channel.input_arg(),
+                    (self._capture_rect[2], self._capture_rect[3]))
                 if mic_on:
                     mic_input = ExtraAudioInput(
                         self.backend.audio_input_args(p["mic_device"]),
@@ -540,17 +538,16 @@ class RecorderWindow(QMainWindow):
                 capture_size=(p["cap_w"], p["cap_h"]),
                 encoder_main=self.backend.encoder_args("main"),
                 encoder_camera=self.backend.encoder_args("camera"))
+            # POSIX channels hand their read end to the child; Windows
+            # channels carry no fds (ffmpeg connects over loopback TCP).
+            pass_fds = [fd for fd in (ch.pass_fd() for ch in channels)
+                        if fd is not None]
             self.proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                pass_fds=tuple(pass_fds) if pass_fds else ())
+                stderr=subprocess.PIPE, pass_fds=tuple(pass_fds))
         except Exception as e:
-            for fd in (self._cam_pipe_write_fd, self._screen_pipe_write_fd):
-                if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+            for channel in channels:
+                channel.discard()
             QMessageBox.critical(self, "PyRecorder", f"Failed to start ffmpeg:\n{e}")
             self._abort_start()
             return
@@ -558,18 +555,15 @@ class RecorderWindow(QMainWindow):
         self.stderr_reader = ProcessOutputReader(self.proc.stderr)
         self.stderr_reader.start()
 
-        # children inherited their own copy of the read ends; drop ours
-        for fd in pass_fds:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        for channel in channels:
+            channel.after_spawn()   # drop the parent's copy of any read end
 
         self.cam_feed = None
         if camera is not None:
             self.cam_feed = CameraPipeFeed(
-                CAMERA_INDEX, self.backend.id, self._cam_pipe_write_fd,
-                camera.fps, size=tuple(camera.size))
+                CAMERA_INDEX, self.backend.id, None,
+                camera.fps, size=tuple(camera.size),
+                sink_factory=cam_channel.connect)
             self.cam_feed.failed.connect(
                 lambda message, session=self._session:
                 self._on_camera_feed_failed(message, session))
@@ -578,8 +572,9 @@ class RecorderWindow(QMainWindow):
         self.screen_feed = None
         if self.backend.screen_capture_kind() != "native":
             self.screen_feed = ScreenPipeFeed(
-                self._capture_rect, self._screen_pipe_write_fd, p["fps"],
-                size=(screen_input.size[0], screen_input.size[1]))
+                self._capture_rect, None, p["fps"],
+                size=(screen_input.size[0], screen_input.size[1]),
+                sink_factory=screen_channel.connect)
             self.screen_feed.failed.connect(
                 lambda message, session=self._session:
                 self._on_screen_feed_failed(message, session))
