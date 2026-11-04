@@ -47,6 +47,7 @@ jobs:
           ditto -c -k --keepParent PyRecorder.app "${{ matrix.artifact }}.zip"
       - name: Package (Windows / Linux)
         if: runner.os != 'macOS'
+        shell: bash
         run: |
           cd dist
           mv PyRecorder "${{ matrix.artifact }}${{ runner.os == 'Windows' && '.exe' || '' }}"
