@@ -31,12 +31,13 @@ PyQt6 + 单进程 ffmpeg。macOS / Windows / Linux 三平台同一套代码、�
 
 | 方式 | 命令 |
 |---|---|
-| pipx（推荐） | `pipx install "pyrecorder[ffmpeg-binary]"`，然后运行 `pyrecorder` |
-| pip | `pip install "pyrecorder[ffmpeg-binary]" && pyrecorder` |
-| 源码 | `git clone … && cd PyRecorder && ./start.command`（mac）/ `start.bat`（Win） |
-| 安装包 | [Releases](https://github.com/CacinieP/PyRecorder/releases) 下载三平台独立包（CI 构建） |
+| 安装包（推荐） | [Releases](https://github.com/CacinieP/PyRecorder/releases) 下载对应平台压缩包，解压即用（CI 构建，自带 ffmpeg） |
+| 源码 | `git clone https://github.com/CacinieP/PyRecorder.git && cd PyRecorder && ./start.command`（mac）/ `start.bat`（Win） |
+| 开发 | `pip install -e ".[ffmpeg-binary,dev]"`，然后 `python -m pyrecorder` |
 
-不带 `[ffmpeg-binary]` 时需要系统 ffmpeg：macOS `brew install ffmpeg`，Windows `winget install Gyan.FFmpeg`，Linux `sudo apt install ffmpeg`。
+> ⚠️ PyPI 上已有同名无关项目 `pyrecorder`（Matplotlib 动画录制器），本工具未发布到 PyPI —— **请勿 `pip install pyrecorder`**。
+
+源码方式默认用 `[ffmpeg-binary]` extra 自带的静态 ffmpeg，零系统依赖；若你已装 ffmpeg（macOS `brew install ffmpeg`，Windows `winget install Gyan.FFmpeg`，Linux `sudo apt install ffmpeg`），PATH 上的版本会被优先使用。
 
 > macOS 首次使用需在「系统设置 → 隐私与安全性」为终端/应用授权屏幕录制、相机、麦克风，改完重启应用。Linux 需要 X11 会话（Wayland 暂不支持，会明确提示而非录黑屏）。
 
