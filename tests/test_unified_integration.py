@@ -34,6 +34,50 @@ class FakeShot:
         self.bgra = bytes([tick % 256]) * (size[0] * size[1] * 4)
 
 
+class DeliverySpan:
+    """Wall-clock window a feeder actually delivered over (first→last write).
+
+    Duration assertions must compare against this measured window, not the
+    nominal sleep: on a loaded CI runner the ffmpeg child can take most of a
+    second to bind its TCP listeners, which shortens the fed window through
+    no fault of the pacing code (a fixed floor flaked exactly this way on
+    the Windows leg).
+    """
+
+    def __init__(self, channel):
+        self.channel = channel
+        self.first = None
+        self.last = None
+
+    def sink_factory(self):
+        def make():
+            return _SpanSink(self.channel.connect(), self)
+        return make
+
+    def window(self):
+        if self.first is None or self.last is None:
+            return 0.0
+        return self.last - self.first
+
+
+class _SpanSink:
+    """Sink wrapper that timestamps every frame handed to ffmpeg."""
+
+    def __init__(self, sink, span):
+        self._sink = sink
+        self._span = span
+
+    def write(self, payload):
+        now = time.monotonic()
+        if self._span.first is None:
+            self._span.first = now
+        self._span.last = now
+        return self._sink.write(payload)
+
+    def close(self):
+        self._sink.close()
+
+
 class FakeMss:
     def __init__(self):
         self.grabs = 0
@@ -91,12 +135,14 @@ def test_real_ffmpeg_pipeline_screen_plus_camera(qapp, tmp_path):
     screen_channel.after_spawn()
     cam_channel.after_spawn()
 
+    screen_span = DeliverySpan(screen_channel)
+    cam_span = DeliverySpan(cam_channel)
     screen_feed = ScreenPipeFeed((0, 0, *SCREEN_SIZE), None, FPS,
                                  size=SCREEN_SIZE, mss_factory=FakeMss,
-                                 sink_factory=screen_channel.connect)
+                                 sink_factory=screen_span.sink_factory())
     cam_feed = CameraPipeFeed(0, "darwin", None, FPS, size=CAMERA_SIZE,
                               opener=lambda idx: FakeCamera(),
-                              sink_factory=cam_channel.connect)
+                              sink_factory=cam_span.sink_factory())
     screen_feed.start()
     cam_feed.start()
 
@@ -133,9 +179,17 @@ def test_real_ffmpeg_pipeline_screen_plus_camera(qapp, tmp_path):
     assert f"width={SCREEN_SIZE[0]}" in details and f"height={SCREEN_SIZE[1]}" in details
     duration = float([line for line in details.splitlines()
                       if line.startswith("duration=")][0].split("=")[1])
-    # the session includes ffmpeg startup; the file must cover most of it
-    assert SECONDS * 0.75 <= duration <= SECONDS * 1.5, \
-        f"duration {duration}s drifted from the {SECONDS}s session"
+    # The file must cover the wall-clock window the screen feeder actually
+    # delivered (timestamped at the channel sink) — the overlay ends when the
+    # main input ends. The nominal sleep is not the right reference: ffmpeg's
+    # listener-binding delay on a loaded runner shrinks the fed window.
+    window = screen_span.window()
+    assert abs(duration - window) <= 1.0, \
+        f"duration {duration:.2f}s vs fed window {window:.2f}s"
+    # and the fed window itself must not have collapsed (the legacy bug this
+    # guards: a 6s session came out as a 1.67s file)
+    assert window >= SECONDS * 0.5, \
+        f"fed window {window:.2f}s collapsed from the {SECONDS}s session"
     assert extra == []
 
 
