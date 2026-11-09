@@ -11,6 +11,14 @@ where python >nul 2>nul || (
     exit /b 1
 )
 
+rem PyRecorder needs Python 3.11+ (pyproject: requires-python) — fail with a
+rem clear message instead of a confusing Requires-Python pip error.
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" || (
+    echo PyRecorder needs Python 3.11+; 'python' on PATH is older. Install it from https://python.org and rerun.
+    pause
+    exit /b 1
+)
+
 if not exist .venv (
     python -m venv .venv
 )
