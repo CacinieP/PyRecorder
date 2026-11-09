@@ -5,4 +5,4 @@ bubble and the microphone are inputs to a single filter graph that writes the
 final MP4 directly (see docs/architecture.md).
 """
 
-__version__ = "1.0.0"
+__version__ = "3.0.0"

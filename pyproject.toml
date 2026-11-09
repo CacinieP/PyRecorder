@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyrecorder"
-version = "1.0.0"
+version = "3.0.0"
 description = "A minimal screen + face + voice recorder for teaching videos (screen, camera bubble, microphone — one MP4, one ffmpeg process)"
 readme = "README.md"
 license = { file = "LICENSE" }
