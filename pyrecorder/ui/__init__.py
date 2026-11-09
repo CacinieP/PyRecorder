@@ -1,0 +1,1 @@
+"""PyRecorder UI (PyQt6)."""

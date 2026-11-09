@@ -1,10 +1,16 @@
-"""Shared pytest setup: make the repo root importable and stay headless."""
+"""Shared pytest setup: make the repo root and legacy/ importable, headless."""
 import os
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+# The frozen legacy editions (legacy/) are imported by their old top-level
+# module names so their tests keep working unchanged.
+LEGACY_ROOT = os.path.join(REPO_ROOT, "legacy")
+if LEGACY_ROOT not in sys.path:
+    sys.path.append(LEGACY_ROOT)
 
 # Tests must not need a window server (CI runs headless).
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
